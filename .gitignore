@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+# benchmark scratch data and stores
+bench_data/
+*.store
+.DS_Store

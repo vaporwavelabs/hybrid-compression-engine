@@ -1,0 +1,4 @@
+numpy
+zstandard
+# optional: only needed by bench.py to generate image samples
+Pillow
