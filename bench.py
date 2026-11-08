@@ -8,15 +8,18 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hybridstore as hs
 
-WORK = sys.argv[1] if len(sys.argv) > 1 else "/tmp/hybrid-bench"
-SRC = "/usr/lib/python3.13"
+WORK = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "bench_data")
+# stdlib source tree of the running interpreter (works on Linux and Windows)
+import sysconfig
+SRC = os.environ.get("HYBRID_BENCH_SRC", sysconfig.get_paths()["stdlib"])
 rng = random.Random(42)
 
 
 def stdlib_files():
     out = []
-    for p in sorted(glob.glob(SRC + "/**/*.py", recursive=True)):
-        if "site-packages" in p or "/test" in p:
+    for p in sorted(glob.glob(os.path.join(SRC, "**", "*.py"), recursive=True)):
+        rel = os.path.relpath(p, SRC).replace(os.sep, "/")
+        if "site-packages" in rel or rel.startswith("test") or "/test" in rel:
             continue
         out.append(p)
     return out
