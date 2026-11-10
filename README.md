@@ -27,8 +27,8 @@ Requirements: Python 3.10+, numpy, `zstandard` (optional; without it only zlib i
 ### Commands
 
 ```
-python hybridstore.py pack   <input_dir> <store>                 # new store (overwrites)
-python hybridstore.py backup <input_dir> <store>                 # add a snapshot; creates the store if missing
+python hybridstore.py pack   <input_dir> <store> [--level N] [--workers N]  # new store (overwrites)
+python hybridstore.py backup <input_dir> <store> [--level N] [--workers N]  # add a snapshot; creates the store if missing
 python hybridstore.py list   <store>                             # show snapshots
 python hybridstore.py unpack <store> <output_dir> [--snapshot N] # default: newest snapshot
 python hybridstore.py verify <store>                             # check every file of every snapshot
@@ -44,14 +44,33 @@ python hybridstore.py verify <store>                             # check every f
 * **Portable paths.** Manifest paths always use `/`. Unpack accepts `/` or `\`, so stores move between Windows and Linux, and it rejects `..`, empty components and (on Windows) drive letters or `:`.
 * **v1 stores** still read. `backup` can append to them; the first time, it rebuilds the index by hashing their chunks once.
 
-Not done yet: removing old snapshots (needs reference counts and a compaction pass) and multi-threaded compression.
+Not done yet: removing old snapshots (needs reference counts and a compaction pass).
+
+### Speed (multi-threaded packing)
+
+* **Faster chunking.** The gear hash is now built by doubling (`H_2m[i] = H_m[i] + (H_m[i-m] << m)`): 6 numpy passes instead of 64, with identical output (a test checks it against the 64-term definition). Segments of large files are split into 1 MiB pieces hashed on worker threads; each piece re-reads the 63 bytes before it, so the cuts are exactly the same.
+* **Parallel compression.** Closed packs are compressed on a thread pool (zstd and zlib release the GIL) and written strictly in pack order, with at most 256 MiB of packs in flight. Each thread has its own compressor objects.
+* **Small files read ahead.** Files up to 8 MiB are read, chunked and hashed in worker threads ahead of the writer, which only does the dedup lookups and pack assembly.
+* **One codec pass.** zlib-9 is no longer tried next to zstd-19 by default: it never won on these data sets and took about three times as long as zstd-19 itself. `BlockCodec(zlib_level=9)` brings it back.
+* **Deterministic.** The store is byte-identical whatever the worker count (checked by a test), so threading cannot change what gets restored.
+* `--workers N` sets the thread count (default: CPU count, at most 16; `1` turns threading off). `--level N` sets the zstd level (default 19). On packs of source code, level 9 compresses about 15x faster for about 9% less ratio.
+* **WAV, BMP and TIFF** are now chunked and compressed like ordinary data instead of being stored as media with only a fast zstd-3 probe, since they are usually uncompressed.
+
+Measured on the Ryzen 7 5800 (8 cores) with real folders on the G: drive (a SATA HDD):
+
+| Folder | Input | Before | Now | Store before → now |
+|---|---|---|---|---|
+| `SFX_Warzone` (94 WAV files) | 162 MB | not timed | 23.5 MB/s | 117 MB → 112 MB |
+| `stack_hat` (12,979 files) | 256 MB | 0.8 MB/s | 11.7 MB/s | 43 MB added in both |
+
+With many small files, the remaining limit is the single writer thread (per-chunk dedup lookups and manifest building), not compression: `--level 9` on `stack_hat` only reached 16 MB/s.
 
 ### How each Phase II fix is implemented
 
 * **FastCDC:** a 256-entry 64-bit gear table derived from SHA-256 (deterministic), with normalized chunking (a strict mask before the 8 KiB average, a loose mask after it) and 2 KiB / 64 KiB min/max sizes. Boundaries use the *high* bits of the hash, because in `h = (h<<1)+G[b]` the low bits depend on only the last few bytes. The hash is computed with numpy in 64 passes, and a test confirms it matches the rolling update exactly. A 3-byte prepend re-aligned all 110 boundaries on 1 MiB of random data.
 * **Dedup index:** `dict[bytes(32)] -> int` pointer. Each pointer is 8 bytes: `pack_id << 20 | index`.
-* **Media before chunking:** magic-byte detection for PNG, JPEG, GIF, BMP, TIFF, WebP, MP4, PDF, ZIP, gzip, bzip2, xz, 7z and zstd, run on the file's first bytes before chunking. Files up to 64 MiB are stored as one object in their own block and are never sliced (see v2 notes for larger ones).
-* **Expansion guard:** each block tries zlib-9 and zstd-19 and keeps the smallest. If no candidate is strictly smaller than the input, the block is written raw (codec bits = 0).
+* **Media before chunking:** magic-byte detection for PNG, JPEG, GIF, WebP, MP4, AVI, PDF, ZIP, gzip, bzip2, xz, 7z and zstd, run on the file's first bytes before chunking (WAV, BMP and TIFF are detected but routed as ordinary data). Files up to 64 MiB are stored as one object in their own block and are never sliced (see v2 notes for larger ones).
+* **Expansion guard:** each block is compressed with zstd-19 (plus zlib-9 if enabled) and the smallest result is kept. If no candidate is strictly smaller than the input, the block is written raw (codec bits = 0).
 * **16-byte header:** `'HCB' | flags u8 | orig_len u32 | stored_len u32 | crc32(original) u32`. The CRC is computed on the decoded bytes, so it also catches codec bugs.
 * **Integrity:** every file also stores its SHA-256. `unpack` and `verify` recompute it and raise `IntegrityError` if it doesn't match, so a restore is bit-exact or it fails. Unpack also rejects path traversal in the manifest.
 * **Neural codec:** `NeuralCodec` is a clearly marked stub and is disabled. Learned image codecs are lossy and need PyTorch plus model weights, which conflicts with this project's bit-exact goal.
@@ -92,4 +111,4 @@ When each ~8 KiB chunk was compressed on its own, the result lost badly to plain
 
 ## 5. Suggested next steps
 
-Use zstd's own long-distance matching inside packs, delta-compress similar chunks (find them by sketch or resemblance), add refcounts/GC so old snapshots can be deleted (the index is now persisted, see v2 notes), use multiple threads for compression, and add a lossless JPEG recompressor (for example, a Brunsli/JPEG XL-style transcode) instead of a lossy neural codec.
+Use zstd's own long-distance matching inside packs, delta-compress similar chunks (find them by sketch or resemblance), add refcounts/GC so old snapshots can be deleted (the index is now persisted, see v2 notes), move dedup lookups and manifest building off the single writer thread for folders with many small files, and add a lossless JPEG recompressor (for example, a Brunsli/JPEG XL-style transcode) instead of a lossy neural codec.

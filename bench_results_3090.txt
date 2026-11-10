@@ -1,62 +1,62 @@
 ﻿
 === code (Python stdlib, 1 copy)  (11,774,155 bytes) ===
--- hybrid, 1 MiB packs: pack 1.0 MB/s, unpack 18.3 MB/s, round trip 696/696 files bit-exact
+-- hybrid, 1 MiB packs: pack 5.5 MB/s, unpack 18.0 MB/s, round trip 696/696 files bit-exact
    snapshot=1 files=696 input=11,774,155B added=2,241,267B store=2,241,267B ratio=5.25x
    chunks total=1677 unique=1668 dedup_saved=29,591B packs=12
    media_files=0 near_dup_images=0 raw_fallback_blocks=0 (0B)
    codecs={'raw': 0, 'zlib': 0, 'zstd': 12, 'neural': 0} dict_coded=0 dict=0B manifest=77,035B
--- hybrid, per-chunk + dict: pack 1.0 MB/s, unpack 17.1 MB/s, round trip 696/696 files bit-exact
-   snapshot=1 files=696 input=11,774,155B added=2,774,427B store=2,774,427B ratio=4.24x
+-- hybrid, per-chunk + dict: pack 3.8 MB/s, unpack 11.6 MB/s, round trip 696/696 files bit-exact
+   snapshot=1 files=696 input=11,774,155B added=2,774,139B store=2,774,139B ratio=4.24x
    chunks total=1677 unique=1668 dedup_saved=29,591B packs=1668
    media_files=0 near_dup_images=0 raw_fallback_blocks=2 (58B)
-   codecs={'raw': 2, 'zlib': 0, 'zstd': 1666, 'neural': 0} dict_coded=1659 dict=35,858B manifest=82,259B
+   codecs={'raw': 2, 'zlib': 0, 'zstd': 1666, 'neural': 0} dict_coded=1659 dict=35,858B manifest=82,250B
 hybrid, 1 MiB packs           2,241,267    5.25x
-hybrid, per-chunk + dict      2,774,427    4.24x
-gzip-9 (tar)                  2,736,816    4.30x
-zstd-3 (tar)                  2,689,809    4.38x
-zstd-19 (tar)                 2,010,202    5.86x
-zstd-19 --long (tar)          2,002,115    5.88x
+hybrid, per-chunk + dict      2,774,139    4.24x
+gzip-9 (tar)                  2,737,035    4.30x
+zstd-3 (tar)                  2,689,670    4.38x
+zstd-19 (tar)                 2,010,261    5.86x
+zstd-19 --long (tar)          2,002,042    5.88x
 
 === backups (3 snapshots, ~3% files edited/night)  (35,323,425 bytes) ===
--- hybrid, 1 MiB packs: pack 1.6 MB/s, unpack 8.3 MB/s, round trip 2088/2088 files bit-exact
+-- hybrid, 1 MiB packs: pack 10.4 MB/s, unpack 17.1 MB/s, round trip 2088/2088 files bit-exact
    snapshot=1 files=2088 input=35,323,425B added=2,305,370B store=2,305,370B ratio=15.32x
    chunks total=5031 unique=1708 dedup_saved=23,307,314B packs=12
    media_files=0 near_dup_images=0 raw_fallback_blocks=0 (0B)
    codecs={'raw': 0, 'zlib': 0, 'zstd': 12, 'neural': 0} dict_coded=0 dict=0B manifest=81,468B
--- hybrid, per-chunk + dict: pack 2.0 MB/s, unpack 16.7 MB/s, round trip 2088/2088 files bit-exact
-   snapshot=1 files=2088 input=35,323,425B added=2,841,621B store=2,841,621B ratio=12.43x
+-- hybrid, per-chunk + dict: pack 7.6 MB/s, unpack 16.7 MB/s, round trip 2088/2088 files bit-exact
+   snapshot=1 files=2088 input=35,323,425B added=2,841,311B store=2,841,311B ratio=12.43x
    chunks total=5031 unique=1708 dedup_saved=23,307,314B packs=1708
    media_files=0 near_dup_images=0 raw_fallback_blocks=2 (58B)
-   codecs={'raw': 2, 'zlib': 0, 'zstd': 1706, 'neural': 0} dict_coded=1699 dict=35,858B manifest=86,741B
+   codecs={'raw': 2, 'zlib': 0, 'zstd': 1706, 'neural': 0} dict_coded=1699 dict=35,858B manifest=86,733B
 hybrid, 1 MiB packs           2,305,370   15.32x
-hybrid, per-chunk + dict      2,841,621   12.43x
-gzip-9 (tar)                  8,213,560    4.30x
-zstd-3 (tar)                  8,063,112    4.38x
-zstd-19 (tar)                 5,927,833    5.96x
-zstd-19 --long (tar)          2,023,852   17.45x
+hybrid, per-chunk + dict      2,841,311   12.43x
+gzip-9 (tar)                  8,204,437    4.31x
+zstd-3 (tar)                  8,046,290    4.39x
+zstd-19 (tar)                 5,915,545    5.97x
+zstd-19 --long (tar)          2,019,416   17.49x
 
 === mixed (logs, JSON, JPEG/PNG, random, gzip)  (11,205,601 bytes) ===
--- hybrid, 1 MiB packs: pack 2.7 MB/s, unpack 234.1 MB/s, round trip 16/16 files bit-exact
-   snapshot=1 files=16 input=11,205,601B added=5,686,779B store=5,686,779B ratio=1.97x
-   chunks total=847 unique=845 dedup_saved=550,434B packs=20
-   media_files=13 near_dup_images=10 raw_fallback_blocks=8 (3,594,156B)
-   codecs={'raw': 8, 'zlib': 0, 'zstd': 12, 'neural': 0} dict_coded=0 dict=0B manifest=28,589B
--- hybrid, per-chunk + dict: pack 1.7 MB/s, unpack 210.1 MB/s, round trip 16/16 files bit-exact
-   snapshot=1 files=16 input=11,205,601B added=5,822,544B store=5,822,544B ratio=1.92x
-   chunks total=847 unique=845 dedup_saved=550,434B packs=845
-   media_files=13 near_dup_images=10 raw_fallback_blocks=83 (3,292,784B)
-   codecs={'raw': 83, 'zlib': 0, 'zstd': 762, 'neural': 0} dict_coded=254 dict=47,917B manifest=31,170B
-hybrid, 1 MiB packs           5,686,779    1.97x
-hybrid, per-chunk + dict      5,822,544    1.92x
-gzip-9 (tar)                  6,400,439    1.75x
-zstd-3 (tar)                  5,937,111    1.89x
-zstd-19 (tar)                 5,643,998    1.99x
-zstd-19 --long (tar)          5,644,036    1.99x
+-- hybrid, 1 MiB packs: pack 13.0 MB/s, unpack 236.8 MB/s, round trip 16/16 files bit-exact
+   snapshot=1 files=16 input=11,205,601B added=5,686,841B store=5,686,841B ratio=1.97x
+   chunks total=848 unique=846 dedup_saved=550,434B packs=20
+   media_files=13 near_dup_images=10 raw_fallback_blocks=8 (3,593,107B)
+   codecs={'raw': 8, 'zlib': 0, 'zstd': 12, 'neural': 0} dict_coded=0 dict=0B manifest=28,622B
+-- hybrid, per-chunk + dict: pack 8.9 MB/s, unpack 198.8 MB/s, round trip 16/16 files bit-exact
+   snapshot=1 files=16 input=11,205,601B added=5,822,435B store=5,822,435B ratio=1.92x
+   chunks total=848 unique=846 dedup_saved=550,434B packs=846
+   media_files=13 near_dup_images=10 raw_fallback_blocks=82 (3,269,788B)
+   codecs={'raw': 82, 'zlib': 0, 'zstd': 764, 'neural': 0} dict_coded=262 dict=48,095B manifest=31,212B
+hybrid, 1 MiB packs           5,686,841    1.97x
+hybrid, per-chunk + dict      5,822,435    1.92x
+gzip-9 (tar)                  6,400,427    1.75x
+zstd-3 (tar)                  5,937,119    1.89x
+zstd-19 (tar)                 5,644,890    1.99x
+zstd-19 --long (tar)          5,644,611    1.99x
 
 === backups, incremental: one `backup` run per night into one store ===
--- night 1: input 11,774,155B, added 2,241,668B to the store, dedup_saved=29,591B, 1.7 MB/s
--- night 2: input 11,774,475B, added 66,881B to the store, dedup_saved=11,641,247B, 4.0 MB/s
--- night 3: input 11,774,795B, added 68,119B to the store, dedup_saved=11,636,476B, 3.9 MB/s
-store 2,376,668B for 35,323,425B of snapshots = 14.86x; round trip 2088/2088 files bit-exact across 3 snapshots
+-- night 1: input 11,774,155B, added 2,241,668B to the store, dedup_saved=29,591B, 8.7 MB/s
+-- night 2: input 11,774,475B, added 66,880B to the store, dedup_saved=11,641,247B, 12.8 MB/s
+-- night 3: input 11,774,795B, added 68,119B to the store, dedup_saved=11,636,476B, 13.3 MB/s
+store 2,376,667B for 35,323,425B of snapshots = 14.86x; round trip 2088/2088 files bit-exact across 3 snapshots
 
 corruption test: 200/200 single-bit flips detected
