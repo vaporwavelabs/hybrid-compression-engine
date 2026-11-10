@@ -124,7 +124,8 @@ def pack_and_check(root, store, **kw):
     out = store + ".out"
     shutil.rmtree(out, ignore_errors=True)
     t0 = time.time()
-    hs.StoreReader(store).unpack(out)
+    with hs.StoreReader(store) as r:
+        r.unpack(out)
     t_unpack = time.time() - t0
     # independent check: compare every file byte-for-byte with the source
     mism = n = 0
@@ -153,6 +154,38 @@ def run(name, root, store):
         print(f"{k:26s} {v:>12,}  {inp/v:6.2f}x")
 
 
+def incremental(root, store):
+    """Back up each nightly snapshot into the SAME store, one run per night,
+    the way a real nightly job would, then restore every snapshot."""
+    if os.path.exists(store):
+        os.remove(store)
+    snaps = sorted(d for d in os.listdir(root) if d.startswith("snapshot_"))
+    total = 0
+    print("\n=== backups, incremental: one `backup` run per night into one store ===")
+    for s in snaps:
+        t0 = time.time()
+        w = hs.StoreWriter(store, append=True); w.add_tree(os.path.join(root, s)); st = w.close()
+        total += st.input_bytes
+        print(f"-- night {st.snapshot}: input {st.input_bytes:,}B, added {st.added_bytes:,}B to the store, "
+              f"dedup_saved={st.dedup_bytes:,}B, {st.input_bytes / 1e6 / (time.time() - t0):.1f} MB/s")
+    size = os.path.getsize(store)
+    ok = n = 0
+    with hs.StoreReader(store) as r:
+        for i, s in enumerate(snaps, 1):
+            out = store + f".out{i}"
+            shutil.rmtree(out, ignore_errors=True)
+            r.unpack(out, snapshot=i)
+            src = os.path.join(root, s)
+            for d, _, fs in os.walk(src):
+                for f in fs:
+                    a = os.path.join(d, f); b = os.path.join(out, os.path.relpath(a, src))
+                    n += 1
+                    ok += os.path.exists(b) and open(a, "rb").read() == open(b, "rb").read()
+            shutil.rmtree(out)
+    print(f"store {size:,}B for {total:,}B of snapshots = {total / size:.2f}x; "
+          f"round trip {ok}/{n} files bit-exact across {len(snaps)} snapshots")
+
+
 def corruption_test(store):
     data = bytearray(open(store, "rb").read())
     caught = 0
@@ -165,7 +198,8 @@ def corruption_test(store):
         p = store + ".bad"
         open(p, "wb").write(bad)
         try:
-            hs.StoreReader(p).verify()
+            with hs.StoreReader(p) as rd:
+                rd.verify()
         except hs.IntegrityError:
             caught += 1
         os.remove(p)
@@ -183,6 +217,7 @@ if __name__ == "__main__":
         root = os.path.join(WORK, f"set{i}")
         fn(root)
         run(name, root, os.path.join(WORK, f"set{i}.hcs"))
+    incremental(os.path.join(WORK, "set1"), os.path.join(WORK, "incremental.hcs"))
     # corruption test on the default (packed) store of the mixed set
     last = os.path.join(WORK, "corrupt_test.hcs")
     w = hs.StoreWriter(last); w.add_tree(os.path.join(WORK, "set2")); w.close()
