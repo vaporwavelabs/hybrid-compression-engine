@@ -57,6 +57,59 @@ def _():
             assert list(c.stream_chunks(io.BytesIO(data), seg)) == whole, (n, seg)
 
 
+@check("doubling gear hash equals the 64-term definition; threaded hashing gives the same cuts")
+def _():
+    from concurrent.futures import ThreadPoolExecutor
+    import numpy as np
+    c = hs.FastCDC()
+    data = os.urandom(300_000)
+    g = hs.GEAR[np.frombuffer(data, dtype=np.uint8)]
+    ref = np.zeros(len(data), dtype=np.uint64)
+    with np.errstate(over="ignore"):
+        for k in range(64):
+            ref[k:] += g[:len(data) - k] << np.uint64(k)
+    assert np.array_equal(c._gear_hash(data), ref)
+    big = os.urandom(5_000_000) + text(4_500_000, 7)
+    with ThreadPoolExecutor(8) as pool:
+        assert c._cuts(big, True, pool) == c._cuts(big, True)
+        assert list(c.stream_chunks(io.BytesIO(big), pool=pool)) == list(c.chunks(big))
+
+
+@check("multi-threaded writer produces a byte-identical store to single-threaded")
+def _():
+    src = os.path.join(TMP, "mt")
+    files = {f"t/{i}.txt": text(rng.randint(1_000, 400_000), 500 + i) for i in range(60)}
+    files["big.log"] = text(20_000_000, 9)            # > PREP_MAX: streamed, pool-hashed
+    files["dup.log"] = files["big.log"]
+    files["rand.bin"] = os.urandom(3_000_000)
+    files["pic.png"] = b"\x89PNG\r\n\x1a\n" + os.urandom(500_000)
+    tree(src, files)
+    real_time, outs = hs.time.time, []
+    hs.time.time = lambda: 1_700_000_000.0
+    try:
+        for workers in (1, 8):
+            store = os.path.join(TMP, f"mt{workers}.hcs")
+            w = hs.StoreWriter(store, workers=workers); w.add_tree(src, use_dictionary=False); w.close()
+            outs.append(open(store, "rb").read())
+    finally:
+        hs.time.time = real_time
+    assert outs[0] == outs[1]
+    with hs.StoreReader(os.path.join(TMP, "mt8.hcs")) as r:
+        out = os.path.join(TMP, "mtout"); r.unpack(out); same_tree(src, out)
+
+
+@check("WAV / BMP are chunked and fully compressed, not treated as media")
+def _():
+    pcm = bytes((i * 7 // 3) & 0xFF for i in range(2_000_000))
+    wav = b"RIFF" + (len(pcm) + 36).to_bytes(4, "little") + b"WAVEfmt " + bytes(24) + pcm
+    assert hs.detect_modality(wav[:16]) == "wave" and hs.media_kind(wav[:16]) is None
+    assert hs.media_kind(b"BM" + bytes(14)) is None and hs.media_kind(b"\x89PNG\r\n\x1a\n" + bytes(8)) == "png"
+    src = os.path.join(TMP, "wav"); tree(src, {"a.wav": wav})
+    store = os.path.join(TMP, "wav.hcs")
+    w = hs.StoreWriter(store); w.add_tree(src); st = w.close()
+    assert st.media_files == 0 and st.store_bytes < len(wav) // 20, st.store_bytes
+
+
 @check("incremental backup: snapshots restore bit-exact and dedup across runs")
 def _():
     src = os.path.join(TMP, "inc")
@@ -113,8 +166,8 @@ def _():
     w = hs.StoreWriter(store, append=True); w.add_tree(src); w.close()
     good = os.path.getsize(store)
     tree(src, {"x9.txt": os.urandom(3_000_000)})
-    w = hs.StoreWriter(store, append=True); w.add_tree(src); w._flush()
-    w.f.close()                                 # "crash": packs written, no manifest/footer
+    w = hs.StoreWriter(store, append=True); w.add_tree(src); w._flush(); w._drain(); w._shutdown()
+    w.f.close()                                # "crash": packs written, no manifest/footer
     assert os.path.getsize(store) > good
     with hs.StoreReader(store) as r:
         assert r.end == good and len(r.snapshots) == 1 and r.verify() == 4
@@ -130,7 +183,7 @@ def _():
     store = os.path.join(TMP, "crash.hcs")
     before = open(store, "rb").read()
     w = hs.StoreWriter(store, append=True)
-    w.add_file("junk.bin", os.urandom(2_000_000)); w._flush()
+    w.add_file("junk.bin", os.urandom(2_000_000)); w._flush(); w._drain()
     w.abort()
     assert open(store, "rb").read() == before
 

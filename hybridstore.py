@@ -47,9 +47,11 @@ import os
 import re
 import struct
 import sys
+import threading
 import time
 import zlib
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -79,6 +81,8 @@ CODEC_NAMES = {0: "raw", 1: "zlib", 2: "zstd", 3: "neural"}
 
 SEGMENT = 8 << 20                   # streaming read size
 WHOLE_MEDIA_MAX = 64 << 20          # media up to this size is stored as one object
+HASH_PIECE = 1 << 20                # per-thread piece when hashing a large segment
+PREP_MAX = 8 << 20                  # files up to this size are read+chunked in worker threads
 
 
 class IntegrityError(Exception):
@@ -129,17 +133,46 @@ class FastCDC:
         self.mask_s = np.uint64(_top_mask(bits + norm_level))  # harder to match
         self.mask_l = np.uint64(_top_mask(bits - norm_level))  # easier to match
 
-    def _hashes(self, data) -> np.ndarray:
-        g = GEAR[np.frombuffer(data, dtype=np.uint8)]
-        h = np.zeros(len(data), dtype=np.uint64)
+    @staticmethod
+    def _gear_hash(buf) -> np.ndarray:
+        """Gear hash at every position of buf (bytes before buf count as 0).
+        Doubling: with H_m[i] = sum_{k<m} G[b_{i-k}] << k,
+        H_2m[i] = H_m[i] + (H_m[i-m] << m), so 6 passes give H_64."""
+        h = GEAR[np.frombuffer(buf, dtype=np.uint8)]
+        t = np.empty_like(h)
+        m = 1
         with np.errstate(over="ignore"):
-            for k in range(64):
-                if k >= len(data):
-                    break
-                h[k:] += g[: len(data) - k] << np.uint64(k)
+            while m < 64:
+                t[:m] = h[:m]
+                np.left_shift(h[:-m], np.uint64(m), out=t[m:])
+                np.add(t[m:], h[m:], out=t[m:])
+                h, t = t, h
+                m <<= 1
         return h
 
-    def _cuts(self, data, final: bool) -> list[int]:
+    def _hashes(self, data) -> np.ndarray:
+        return self._gear_hash(data)
+
+    def _candidates(self, data, pool=None) -> tuple[np.ndarray, np.ndarray]:
+        """Positions whose hash passes the strict / loose mask. With a thread
+        pool, large buffers are split into pieces (each re-reads the 63 bytes
+        before it, so the result is identical); numpy releases the GIL."""
+        n = len(data)
+
+        def piece(p, q):
+            s = max(0, p - 63)
+            h = self._gear_hash(mv[s:q])[p - s:]
+            cl = np.flatnonzero((h & self.mask_l) == 0)
+            cs = cl[(h[cl] & self.mask_s) == 0]   # strict mask bits include the loose ones
+            return cs + p, cl + p
+
+        with memoryview(data) as mv:
+            if pool is None or n < 2 * HASH_PIECE:
+                return piece(0, n)
+            parts = list(pool.map(lambda p: piece(p, min(p + HASH_PIECE, n)), range(0, n, HASH_PIECE)))
+        return (np.concatenate([a for a, _ in parts]), np.concatenate([b for _, b in parts]))
+
+    def _cuts(self, data, final: bool, pool=None) -> list[int]:
         """Cut points in `data` (which must start at a chunk boundary). With
         final=False, stop at the first chunk whose end could still depend on
         bytes not yet read."""
@@ -148,9 +181,7 @@ class FastCDC:
             return []
         if n <= self.min_size:
             return [n]
-        h = self._hashes(data)
-        cand_s = np.flatnonzero((h & self.mask_s) == 0)
-        cand_l = np.flatnonzero((h & self.mask_l) == 0)
+        cand_s, cand_l = self._candidates(data, pool)
         cuts, start = [], 0
         while start < n:
             if not final and start + self.max_size > n:
@@ -185,9 +216,11 @@ class FastCDC:
             yield data[start:end]
             start = end
 
-    def stream_chunks(self, f, segment: int = SEGMENT):
+    def stream_chunks(self, f, segment: int = SEGMENT, pool=None):
         """Yield chunks from a binary file object, holding at most about
-        segment + max_size bytes in memory."""
+        segment + max_size bytes in memory. `pool` (optional) parallelises
+        the hashing of each segment; never pass a pool from inside one of
+        its own worker threads."""
         buf = bytearray()
         eof = False
         while not eof:
@@ -197,7 +230,7 @@ class FastCDC:
             else:
                 eof = True
             start = 0
-            for end in self._cuts(buf, final=eof):
+            for end in self._cuts(buf, final=eof, pool=pool):
                 yield bytes(buf[start:end])
                 start = end
             del buf[:start]
@@ -242,7 +275,17 @@ def detect_modality(data: bytes) -> str | None:
     return None
 
 
-IMAGE_TYPES = {"png", "jpeg", "gif", "bmp", "tiff", "webp"}
+IMAGE_TYPES = {"png", "jpeg", "gif", "webp"}
+# Detected, but usually uncompressed (PCM audio, bitmaps): route them like
+# generic data so they get chunked and fully compressed. "BM" is also only a
+# 2-byte magic, so treating it as media misrouted ordinary files.
+UNCOMPRESSED_TYPES = {"wave", "bmp", "tiff"}
+
+
+def media_kind(head: bytes) -> str | None:
+    """Modality used for routing: None means chunk + compress normally."""
+    kind = detect_modality(head)
+    return None if kind in UNCOMPRESSED_TYPES else kind
 
 
 def dhash64(data: bytes) -> int | None:
@@ -277,17 +320,29 @@ class NeuralCodec:
 
 
 class BlockCodec:
-    def __init__(self, zstd_level=19, zlib_level: int | None = 9, media_zstd_level=3):
-        """zlib_level=None skips the zlib candidate (zlib is still used when
-        zstandard is not installed). Media blocks are only probed with a fast
-        zstd level, since they are almost always incompressible."""
+    def __init__(self, zstd_level=19, zlib_level: int | None = None, media_zstd_level=3):
+        """Default: one zstd pass. zlib_level adds zlib as a second candidate
+        (it almost never beats zstd at 19 and costs ~3x zstd-19's time on top);
+        without zstandard installed, zlib-9 is used. Media blocks are only
+        probed with a fast zstd level, since they are almost always
+        incompressible. encode() is safe to call from several threads: each
+        thread gets its own compressor objects."""
         self.zstd_level = zstd_level
+        self.media_zstd_level = media_zstd_level
         self.zlib_level = zlib_level if zlib_level is not None else (9 if zstd is None else None)
-        self.zc = zstd.ZstdCompressor(level=zstd_level) if zstd else None
-        self.zc_media = zstd.ZstdCompressor(level=media_zstd_level) if zstd else None
         self.zd = zstd.ZstdDecompressor() if zstd else None
-        self.zc_dict = self.zd_dict = None
+        self._dict = self.zd_dict = None
+        self._tls = threading.local()
         self.neural = NeuralCodec()
+
+    def _compressors(self):
+        c = getattr(self._tls, "c", None)
+        if c is None or c[3] is not self._dict:
+            zc = zstd.ZstdCompressor(level=self.zstd_level) if zstd else None
+            zm = zstd.ZstdCompressor(level=self.media_zstd_level) if zstd else None
+            zdc = zstd.ZstdCompressor(level=self.zstd_level, dict_data=self._dict) if self._dict else None
+            c = self._tls.c = (zc, zm, zdc, self._dict)
+        return c
 
     def set_dictionary(self, dict_bytes: bytes):
         """Small chunks lose the cross-chunk context a whole-stream compressor
@@ -296,26 +351,28 @@ class BlockCodec:
         if zstd is None:
             raise IntegrityError("store uses a zstd dictionary but zstandard is not installed")
         d = zstd.ZstdCompressionDict(dict_bytes)
-        self.zc_dict = zstd.ZstdCompressor(level=self.zstd_level, dict_data=d)
+        d.precompute_compress(level=self.zstd_level)
+        self._dict = d
         self.zd_dict = zstd.ZstdDecompressor(dict_data=d)
 
     def encode(self, data: bytes, flags: int = 0) -> tuple[bytes, dict]:
         """Return (header + payload, info). Picks the smallest candidate and
         falls back to raw unless compression is strictly smaller."""
         best_codec, best = CODEC_RAW, data
+        zc, zm, zdc, _ = self._compressors()
         candidates = []
         if flags & FLAG_MEDIA:
-            if self.zc_media:
-                candidates.append((CODEC_ZSTD, lambda: self.zc_media.compress(data)))
+            if zm:
+                candidates.append((CODEC_ZSTD, lambda: zm.compress(data)))
             else:
                 candidates.append((CODEC_ZLIB, lambda: zlib.compress(data, 1)))
         else:
             if self.zlib_level is not None:
                 candidates.append((CODEC_ZLIB, lambda: zlib.compress(data, self.zlib_level)))
-            if self.zc:
-                candidates.append((CODEC_ZSTD, lambda: self.zc.compress(data)))
-            if self.zc_dict and not flags & (FLAG_MANIFEST | FLAG_DICT):
-                candidates.append((CODEC_ZSTD | FLAG_USES_DICT, lambda: self.zc_dict.compress(data)))
+            if zc:
+                candidates.append((CODEC_ZSTD, lambda: zc.compress(data)))
+            if zdc and not flags & (FLAG_MANIFEST | FLAG_DICT):
+                candidates.append((CODEC_ZSTD | FLAG_USES_DICT, lambda: zdc.compress(data)))
         for codec, fn in candidates:
             out = fn()
             if len(out) < len(best):
@@ -486,7 +543,12 @@ class StoreWriter:
 
     def __init__(self, path: str, chunker: FastCDC | None = None, codec: BlockCodec | None = None,
                  pack_target: int = 1 << 20, near_dup_hamming: int = 6,
-                 append: bool = False, label: str = ""):
+                 append: bool = False, label: str = "", workers: int | None = None,
+                 max_pending_bytes: int = 256 << 20):
+        """workers: threads for reading/chunking small files, hashing large
+        ones and compressing packs (default: CPU count, max 16; 1 = no
+        threads). Output is byte-identical whatever the worker count, except
+        for the manifest timestamp."""
         self.path = path
         self.chunker = chunker or FastCDC()
         self.codec = codec or BlockCodec()
@@ -519,19 +581,23 @@ class StoreWriter:
             self.pos = self.start = len(STORE_MAGIC)
             self.created = True
         self.first_new_pack = len(self.pack_offsets)
+        self.next_pack = len(self.pack_offsets)  # id of the pack being filled
         self.open_pack: list[bytes] = []
         self.open_pack_bytes = 0
         self.open_flags = 0
         self.entries: list[FileEntry] = []
         self.image_hashes: list[int] = []
         self.near_dup_hamming = near_dup_hamming
+        if workers is None:
+            workers = min(os.cpu_count() or 1, 16)
+        self.workers = max(1, workers)
+        self.pool = ThreadPoolExecutor(self.workers, thread_name_prefix="hcs") if self.workers > 1 else None
+        self.pending: deque = deque()            # (future, payload_len) in pack-id order
+        self.pending_bytes = 0
+        self.max_pending_bytes = max_pending_bytes
 
     # ---- packs ----
-    def _flush(self):
-        if not self.open_pack:
-            return
-        payload = _encode_pack(self.open_pack)
-        block, info = self.codec.encode(payload, self.open_flags)
+    def _write_block(self, block: bytes, info: dict, payload_len: int):
         self.pack_offsets.append(self.pos)
         self.f.write(block)
         self.pos += len(block)
@@ -541,11 +607,39 @@ class StoreWriter:
         st.dict_blocks += info["dict"]
         if info["raw_fallback"]:
             st.raw_fallback_blocks += 1
-            st.raw_fallback_bytes += len(payload)
-        self.open_pack, self.open_pack_bytes = [], 0
+            st.raw_fallback_bytes += payload_len
 
-    def _put(self, data: bytes, flags: int = 0, alone: bool = False) -> int:
-        digest = hashlib.sha256(data).digest()
+    def _write_next(self):
+        fut, n = self.pending.popleft()
+        self.pending_bytes -= n
+        self._write_block(*fut.result(), n)
+
+    def _drain(self):
+        """Write every pack still being compressed, in order."""
+        while self.pending:
+            self._write_next()
+
+    def _flush(self):
+        """Close the open pack: compress it (on the pool when there is one)
+        and queue it for writing. Packs are always written in id order."""
+        if not self.open_pack:
+            return
+        payload = _encode_pack(self.open_pack)
+        flags = self.open_flags
+        self.open_pack, self.open_pack_bytes = [], 0
+        self.next_pack += 1
+        if self.pool is None:
+            self._write_block(*self.codec.encode(payload, flags), len(payload))
+            return
+        self.pending.append((self.pool.submit(self.codec.encode, payload, flags), len(payload)))
+        self.pending_bytes += len(payload)
+        while self.pending and (self.pending[0][0].done() or self.pending_bytes > self.max_pending_bytes
+                                or len(self.pending) > 4 * self.workers):
+            self._write_next()
+
+    def _put(self, data: bytes, flags: int = 0, alone: bool = False, digest: bytes | None = None) -> int:
+        if digest is None:
+            digest = hashlib.sha256(data).digest()
         self.stats.chunks_total += 1
         ptr = self.index.get(digest)
         if ptr is not None:
@@ -554,8 +648,7 @@ class StoreWriter:
         if self.open_pack and (alone or flags != self.open_flags):
             self._flush()                  # media never shares a pack with other data
         self.open_flags = flags
-        pack_id = len(self.pack_offsets)
-        ptr = (pack_id << PTR_SHIFT) | len(self.open_pack)
+        ptr = (self.next_pack << PTR_SHIFT) | len(self.open_pack)
         self.open_pack.append(data)
         self.open_pack_bytes += len(data)
         if alone or self.open_pack_bytes >= self.pack_target or len(self.open_pack) >= PTR_IDX_MASK:
@@ -573,29 +666,68 @@ class StoreWriter:
         f.seek(0, os.SEEK_END)
         size = f.tell()
         f.seek(0)
-        kind = detect_modality(head)
+        kind = media_kind(head)
+        if size <= PREP_MAX:
+            self._add_prepared(rel_path, self._prepare_bytes(f.read()))
+            return
         hr = _HashingReader(f)
         entry = FileEntry(_norm_path(rel_path), 0, b"")
         if kind is not None and size <= WHOLE_MEDIA_MAX:
             st.media_files += 1
             data = hr.read()
-            if kind in IMAGE_TYPES:
-                h = dhash64(data)
-                if h is not None:
-                    if any(bin(h ^ o).count("1") <= self.near_dup_hamming for o in self.image_hashes):
-                        st.near_dup_images += 1   # reported only; see README
-                    self.image_hashes.append(h)
+            self._note_image(kind, dhash64(data) if kind in IMAGE_TYPES else None)
             entry.pointers.append(self._put(data, FLAG_MEDIA, alone=True))
         else:
             flags = 0
             if kind is not None:
                 st.media_files += 1
                 flags = FLAG_MEDIA
-            for chunk in self.chunker.stream_chunks(hr):
+            for chunk in self.chunker.stream_chunks(hr, pool=self.pool):
                 entry.pointers.append(self._put(chunk, flags))
         entry.size, entry.sha256 = hr.size, hr.sha.digest()
         st.files += 1
         st.input_bytes += hr.size
+        self.entries.append(entry)
+
+    def _note_image(self, kind, h):
+        if h is not None:
+            if any(bin(h ^ o).count("1") <= self.near_dup_hamming for o in self.image_hashes):
+                self.stats.near_dup_images += 1   # reported only; see README
+            self.image_hashes.append(h)
+
+    def _prepare_bytes(self, data: bytes):
+        """Everything per-file that does not touch writer state: routing,
+        chunking and hashing. Safe to run in a worker thread."""
+        kind = media_kind(data[:16])
+        sha = hashlib.sha256(data).digest()
+        if kind is not None:
+            dh = dhash64(data) if kind in IMAGE_TYPES else None
+            return kind, len(data), sha, [data], [sha], dh
+        chunks = list(self.chunker.chunks(data))
+        return kind, len(data), sha, chunks, [hashlib.sha256(c).digest() for c in chunks], None
+
+    def _prepare_path(self, full: str):
+        """Read and prepare a small file, or return None for one that should
+        be streamed (large, or grew past PREP_MAX)."""
+        if os.path.getsize(full) > PREP_MAX:
+            return None
+        with open(full, "rb") as fh:
+            data = fh.read(PREP_MAX + 1)
+        return None if len(data) > PREP_MAX else self._prepare_bytes(data)
+
+    def _add_prepared(self, rel_path: str, prep):
+        kind, size, sha, chunks, digests, dh = prep
+        st = self.stats
+        entry = FileEntry(_norm_path(rel_path), size, sha)
+        if kind is not None:
+            st.media_files += 1
+            self._note_image(kind, dh)
+            entry.pointers.append(self._put(chunks[0], FLAG_MEDIA, alone=True, digest=digests[0]))
+        else:
+            for c, d in zip(chunks, digests):
+                entry.pointers.append(self._put(c, 0, digest=d))
+        st.files += 1
+        st.input_bytes += size
         self.entries.append(entry)
 
     def add_file(self, rel_path: str, data: bytes):
@@ -641,10 +773,10 @@ class StoreWriter:
             seen, samples, budget = set(), [], sample_budget
             for full in files:
                 with open(full, "rb") as fh:
-                    if detect_modality(fh.read(16)) is not None:
+                    if media_kind(fh.read(16)) is not None:
                         continue
                     fh.seek(0)
-                    for c in self.chunker.stream_chunks(fh):
+                    for c in self.chunker.stream_chunks(fh, pool=self.pool):
                         k = hashlib.sha256(c).digest()
                         if k not in seen:
                             seen.add(k); samples.append(c); budget -= len(c)
@@ -653,12 +785,55 @@ class StoreWriter:
                 if budget <= 0:
                     break
             self.train_dictionary(samples)
-        for full in files:
-            with open(full, "rb") as fh:
-                self.add_stream(os.path.relpath(full, root), fh)
+        for full, prep in self._prepared(files):
+            rel = os.path.relpath(full, root)
+            if prep is not None:
+                self._add_prepared(rel, prep)
+            else:
+                with open(full, "rb") as fh:
+                    self.add_stream(rel, fh)
+
+    def _prepared(self, files):
+        """Yield (path, prepared-or-None) in input order. With a pool, small
+        files are read, chunked and hashed ahead in worker threads (bounded
+        look-ahead, so memory stays around 4 x workers x PREP_MAX at worst)."""
+        if self.pool is None:
+            for full in files:
+                yield full, None
+            return
+        ahead: deque = deque()
+        it = iter(files)
+        limit = 4 * self.workers
+        try:
+            for full in it:
+                ahead.append((full, self.pool.submit(self._prepare_path, full)))
+                if len(ahead) >= limit:
+                    break
+            while ahead:
+                full, fut = ahead.popleft()
+                nxt = next(it, None)
+                if nxt is not None:
+                    ahead.append((nxt, self.pool.submit(self._prepare_path, nxt)))
+                yield full, fut.result()
+        finally:
+            for _, fut in ahead:
+                fut.cancel()
+
+    def _shutdown(self):
+        if self.pool is not None:
+            for fut, _ in self.pending:
+                fut.cancel()
+            self.pool.shutdown(wait=True)
+            self.pool = None
+        self.pending.clear()
+        self.pending_bytes = 0
 
     def close(self) -> Stats:
-        self._flush()
+        try:
+            self._flush()
+            self._drain()
+        finally:
+            self._shutdown()
         new_packs = self.pack_offsets[self.first_new_pack:]
         label = self.label.encode("utf-8")[:65535]
         digests = b"".join(d for d, _ in self.new_index)
@@ -693,6 +868,7 @@ class StoreWriter:
 
     def abort(self):
         """Discard everything written by this run."""
+        self._shutdown()
         try:
             if self.created:
                 self.f.close()
@@ -969,12 +1145,12 @@ def _fmt(st: Stats) -> str:
             f"manifest={st.manifest_bytes:,}B")
 
 
-def _write(store: str, src: str, append: bool) -> int:
+def _write(store: str, src: str, append: bool, level: int = 19, workers: int | None = None) -> int:
     if not os.path.isdir(src):
         print(f"error: {src} is not a directory", file=sys.stderr)
         return 2
     t0 = time.time()
-    w = StoreWriter(store, append=append)
+    w = StoreWriter(store, codec=BlockCodec(zstd_level=level), append=append, workers=workers)
     if w.recovered_bytes:
         print(f"note: discarded {w.recovered_bytes:,} bytes left by an interrupted earlier run",
               file=sys.stderr)
@@ -994,10 +1170,14 @@ def main(argv) -> int:
     ap = argparse.ArgumentParser(prog="hybridstore", description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("pack", help="pack a directory into a NEW store (overwrites)")
-    p.add_argument("input_dir"); p.add_argument("store")
-    p = sub.add_parser("backup", help="add a snapshot of a directory (creates the store if missing)")
-    p.add_argument("input_dir"); p.add_argument("store")
+    for name, hlp in (("pack", "pack a directory into a NEW store (overwrites)"),
+                      ("backup", "add a snapshot of a directory (creates the store if missing)")):
+        p = sub.add_parser(name, help=hlp)
+        p.add_argument("input_dir"); p.add_argument("store")
+        p.add_argument("--level", type=int, default=19,
+                       help="zstd level 1-22 (default 19; 9 is ~15x faster for ~10%% less ratio)")
+        p.add_argument("--workers", type=int, default=None,
+                       help="threads (default: CPU count, max 16; 1 = single-threaded)")
     p = sub.add_parser("list", help="list snapshots")
     p.add_argument("store")
     p = sub.add_parser("unpack", help="restore a snapshot (default: newest)")
@@ -1009,9 +1189,9 @@ def main(argv) -> int:
 
     try:
         if a.cmd == "pack":
-            return _write(a.store, a.input_dir, append=False)
+            return _write(a.store, a.input_dir, append=False, level=a.level, workers=a.workers)
         if a.cmd == "backup":
-            return _write(a.store, a.input_dir, append=True)
+            return _write(a.store, a.input_dir, append=True, level=a.level, workers=a.workers)
         with StoreReader(a.store) as r:
             if a.cmd == "list":
                 print(f"{'#':>3}  {'created':19}  {'files':>7}  {'bytes':>15}  source")
