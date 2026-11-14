@@ -97,7 +97,7 @@ u32 count | count × u32 chunk_length | chunk bytes concatenated
 ```
 "HCM3"
 u64 prev_manifest_offset        0 for the first snapshot
-u64 created                     unix seconds
+u64 created                     unix seconds when the run STARTED (every file was read after it)
 u16 label_len | label           utf-8 (source directory)
 u32 first_pack_id | u32 n_packs | n_packs × u64 pack_offset
 u32 n_index | n_index × 32-byte sha256 | n_index × u64 pointer
@@ -157,6 +157,25 @@ u32 n_packs | n_packs × u64 pack_offset | u32 n_entries | v2-style entries
 Readers must accept all three versions in one chain, since v2 and v3
 snapshots can be appended to older stores. Versions before v3 cannot read v3
 manifests.
+
+### Reusing unchanged files (writer behaviour, no format change)
+
+A `backup` can copy a file's entry (size, sha256, pointers) from the newest
+earlier v3 snapshot whose `label` (source folder) matches, without reading
+the file. All of these must hold:
+
+* the path is the same;
+* the kind is `file` in both snapshots;
+* the size is equal;
+* `mtime_ns` is equal;
+* that earlier `mtime_ns` is more than 3 s before that snapshot's `created`.
+
+The last rule protects against an edit made in the same timestamp tick as
+the earlier read. The new entry records the file's current `mtime_ns`,
+`st_mode` and `win_attrs`. `--rehash` disables reuse.
+
+Limitation: content changed while both size and mtime stay exactly the same
+(some tools restore mtimes) is not seen until a `--rehash` run.
 
 ## 5. Restoring a snapshot
 

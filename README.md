@@ -17,7 +17,7 @@ It lists five Phase I bugs and Phase II fixes: a naive XOR boundary test (fix: a
 | `hybridstore.py` | The engine and CLI (commands below) |
 | `bench.py` | Builds the sample datasets, checks round trips, runs an incremental-backup run and the corruption test, compares against baselines |
 | `bench_large.py` | Packs, verifies and restores one large file (default 2 GiB) and reports peak memory |
-| `test_hybridstore.py` | 17 checks: streaming, snapshots, v1 compatibility, crash recovery, path safety, large media, locking, skipped files, strict verify, decompression bombs, metadata |
+| `test_hybridstore.py` | 18 checks: streaming, snapshots, v1 compatibility, crash recovery, path safety, large media, locking, skipped files, strict verify, decompression bombs, metadata, unchanged-file reuse |
 | `FORMAT.md` | Byte-level specification of the store format |
 | `hybridstore.cmd` | Windows launcher that uses the local `.venv` |
 | `bench_results.txt` | Output of the original benchmark run (Linux container, v1 engine) |
@@ -29,7 +29,7 @@ Requirements: Python 3.10+, numpy, `zstandard` (optional; without it only zlib i
 
 ```
 python hybridstore.py pack   <input_dir> <store> [--level N] [--workers N]  # new store (overwrites)
-python hybridstore.py backup <input_dir> <store> [--level N] [--workers N]  # add a snapshot; creates the store if missing
+python hybridstore.py backup <input_dir> <store> [--level N] [--workers N] [--rehash]  # add a snapshot; creates the store if missing
 python hybridstore.py list   <store> [--skipped]                 # show snapshots (and what each could not read)
 python hybridstore.py unpack <store> <output_dir> [--snapshot N] # default: newest snapshot
 python hybridstore.py verify <store> [--allow-partial]           # check layout, every block, the index and every file
@@ -153,9 +153,28 @@ When each ~8 KiB chunk was compressed on its own, the result lost badly to plain
 
 ## 5. Suggested next steps
 
-Phase 2 of the hardening plan:
+### Skipping unchanged files (Phase 2, step 1)
 
-* Skip unchanged files by size and mtime.
+`backup` no longer reads files that have not changed. A file is reused when its path, size and modification time match the previous snapshot of the same source folder. The new snapshot then points at the same chunks, and current permissions and attributes are still recorded.
+
+* **The folder scan is nearly free.** It uses `os.scandir`, so on Windows the size and time come straight from the directory listing, with no extra system call per file.
+* **Measured on a real folder** (the project's `.venv`: 2,556 files, 81 MB, in 306 folders):
+
+  | Run | Time |
+  |---|---|
+  | First backup | 8.5 s |
+  | Unchanged re-run | **0.6 s**, 0 bytes of file contents read |
+  | `--rehash` | 4.4 s |
+
+  Each extra snapshot added only its file list (136 KB).
+* **Safety rules:**
+  * A file is never reused if its time is within 3 seconds of the start of the backup that read it. An edit made in the same clock tick as that read could otherwise be missed.
+  * Snapshots now record the time the run started, not when it finished.
+  * Only snapshots of the same source folder are compared, so two different folders backed up into one store never borrow from each other.
+* **Limitation:** content changed while both size and time stay exactly the same is only picked up by `backup --rehash`. Some copy tools preserve times, so run `--rehash` now and then, for example monthly.
+
+Next in Phase 2:
+
 * Delete snapshots, with refcounts and garbage collection.
 * Encryption (AES-GCM or ChaCha20-Poly1305 with Argon2id).
 * An on-disk dedup index, so the index no longer takes about 17 GB of RAM per TB of unique data.

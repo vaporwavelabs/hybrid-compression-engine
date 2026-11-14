@@ -386,6 +386,52 @@ def _():
         os.chmod(os.path.join(base, "a.txt"), st_.S_IREAD | st_.S_IWRITE)
 
 
+@check("unchanged files are reused by size + mtime; edits, racy mtimes, other folders and --rehash are handled")
+def _():
+    import stat as st_, time
+    src = os.path.join(TMP, "skip")
+    files = {f"f{i}.txt": text(300_000, 700 + i) for i in range(10)}
+    tree(src, files)
+    old = int(time.time() - 3600) * 10**9                 # whole seconds: NTFS keeps 100 ns steps
+    for name in files:
+        os.utime(os.path.join(src, name), ns=(old, old))
+    open(os.path.join(src, "fresh.txt"), "wb").write(b"just written")   # mtime ~ now: racy
+    store = os.path.join(TMP, "skip.hcs")
+    w = hs.StoreWriter(store, append=True); w.add_tree(src); s1 = w.close()
+    assert s1.reused_files == 0 and s1.files == 11
+    # edit f3 (same size, newer mtime), make f5 read-only (mode change only, mtime unchanged)
+    f3 = os.path.join(src, "f3.txt")
+    open(f3, "r+b").write(b"EDITED")
+    os.utime(f3, ns=(old + 10**9, old + 10**9))
+    os.chmod(os.path.join(src, "f5.txt"), st_.S_IREAD)
+    w = hs.StoreWriter(store, append=True); w.add_tree(src); s2 = w.close()
+    assert s2.reused_files == 9 and s2.reused_bytes == 9 * 300_000, s2     # all but f3 and fresh.txt
+    assert s2.chunks_total < 100, s2.chunks_total                          # only f3 + fresh.txt were chunked
+    # a different folder with the same names, sizes and mtimes must not reuse anything
+    other = os.path.join(TMP, "skip_other")
+    tree(other, {n: os.urandom(len(d)) for n, d in files.items()})
+    for name in files:
+        os.utime(os.path.join(other, name), ns=(old, old))
+    w = hs.StoreWriter(store, append=True); w.add_tree(other); s3 = w.close()
+    assert s3.reused_files == 0, s3.reused_files
+    # back to the first folder: its own previous snapshot is found again; --rehash reads everything
+    w = hs.StoreWriter(store, append=True); w.add_tree(src); s4 = w.close()
+    assert s4.reused_files >= 10, s4.reused_files
+    w = hs.StoreWriter(store, append=True); w.add_tree(src, rehash=True); s5 = w.close()
+    assert s5.reused_files == 0 and s5.dedup_bytes == s5.input_bytes, s5
+    with hs.StoreReader(store) as r:
+        assert r.verify() == 5 * 11 - 1                                    # snapshot 3 has 10 files
+        for snap, folder in ((2, src), (3, other), (4, src)):
+            out = os.path.join(TMP, f"skip_out{snap}")
+            r.unpack(out, snapshot=snap); same_tree(folder, out)
+            assert not os.access(os.path.join(out, "f5.txt"), os.W_OK) or folder == other
+            os.chmod(os.path.join(out, "f5.txt"), st_.S_IREAD | st_.S_IWRITE)
+        e = {x.path: x for x in r.snapshots[1].entries}
+        assert (e["f5.txt"].mode & st_.S_IWRITE) == 0 and e["f3.txt"].mtime_ns == old + 10**9
+    os.chmod(os.path.join(src, "f5.txt"), st_.S_IREAD | st_.S_IWRITE)
+    assert hs.main(["backup", src, store, "--rehash"]) == 0
+
+
 @check("a failed `pack` over an existing store leaves the old store untouched")
 def _():
     store = os.path.join(TMP, "lock.hcs")

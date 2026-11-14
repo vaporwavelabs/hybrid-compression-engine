@@ -94,6 +94,9 @@ PREP_MAX = 8 << 20                  # files up to this size are read+chunked in 
 # hostile or corrupt headers from making the reader allocate gigabytes.
 BLOCK_FLOOR = 256 << 20
 BLOCK_RATIO = 256
+# A file is only reused by size + mtime if its mtime is at least this much older
+# than the snapshot that read it (covers coarse filesystem timestamps, e.g. FAT's 2 s).
+RACY_NS = 3_000_000_000
 
 # Entry kinds (manifest v3)
 KIND_FILE, KIND_DIR, KIND_LINK, KIND_DIRLINK = 0, 1, 2, 3
@@ -625,6 +628,8 @@ class Stats:
     added_bytes: int = 0        # bytes this run added to the store file
     dirs: int = 0
     links: int = 0
+    reused_files: int = 0       # unchanged since the previous snapshot: not read again
+    reused_bytes: int = 0
     skipped: list = field(default_factory=list)   # (path, reason) of files that could not be read
 
 
@@ -725,6 +730,7 @@ class StoreWriter:
     def _init(self, path, chunker, codec, pack_target, near_dup_hamming, append, label,
               workers, max_pending_bytes):
         self._finished = False
+        self.started = time.time()       # snapshot time = start of the run (every read is after it)
         self.path = path
         self.chunker = chunker or FastCDC()
         self.codec = codec or BlockCodec()
@@ -736,6 +742,7 @@ class StoreWriter:
         self.prev_manifest = 0
         self.has_dict = False
         self.stats = Stats()
+        self.prev_snapshots: list[Snapshot] = []
         self.recovered_bytes = 0               # tail bytes dropped from an interrupted write
         if append and os.path.exists(path) and os.path.getsize(path) > 0:
             with StoreReader(path, codec=self.codec, load_index=True) as r:
@@ -743,6 +750,7 @@ class StoreWriter:
                 self.index = r.index
                 self.prev_manifest = r.snapshots[-1].offset
                 self.has_dict = r.has_dict
+                self.prev_snapshots = r.snapshots
                 self.stats.snapshot = len(r.snapshots) + 1
                 end = r.end
                 self.recovered_bytes = r.file_size - r.end
@@ -940,37 +948,54 @@ class StoreWriter:
         return True
 
     def _walk(self, root: str):
-        """Yield (full_path, kind) in a stable order: every directory (so
-        empty ones and their metadata survive), symlinks / junctions as links
-        (never followed), regular files. Directories that cannot be listed
-        are reported as skipped."""
-        def onerror(e):
-            self._skip(os.path.relpath(e.filename, root) if e.filename else root, e)
-        for dirpath, dirnames, filenames in os.walk(root, onerror=onerror):
-            dirnames.sort()
-            keep = []
-            for name in dirnames:
-                full = os.path.join(dirpath, name)
-                if _is_link(full):
-                    yield full, KIND_DIRLINK
-                else:
-                    yield full, KIND_DIR
-                    keep.append(name)
-            dirnames[:] = keep
-            for name in sorted(filenames):
-                full = os.path.join(dirpath, name)
-                if _is_link(full):
-                    yield full, KIND_LINK
-                elif os.path.isfile(full):
-                    yield full, KIND_FILE
+        """Yield (full_path, kind, lstat) in a stable order (top-down; in each
+        directory: its subdirectories, then its files, each sorted by name):
+        every directory (so empty ones and their metadata survive), symlinks /
+        junctions as links (never followed), regular files. Uses scandir, so
+        on Windows the stat comes from the directory listing for free.
+        Directories that cannot be listed are reported as skipped."""
+        def visit(path):
+            try:
+                with os.scandir(path) as it:
+                    ents = list(it)
+            except OSError as e:
+                self._skip(os.path.relpath(path, root) if path != root else ".", e)
+                return
+            dirs, files = [], []
+            for de in ents:
+                try:
+                    if de.is_symlink() or (hasattr(de, "is_junction") and de.is_junction()):
+                        isdir = de.is_dir()
+                        (dirs if isdir else files).append((de.name, KIND_DIRLINK if isdir else KIND_LINK, de))
+                    elif de.is_dir(follow_symlinks=False):
+                        dirs.append((de.name, KIND_DIR, de))
+                    elif de.is_file(follow_symlinks=False):
+                        files.append((de.name, KIND_FILE, de))
+                except OSError:
+                    continue                       # vanished while listing
+            dirs.sort(key=lambda t: t[0]); files.sort(key=lambda t: t[0])
+            subdirs = []
+            for _, kind, de in dirs + files:
+                full = de.path
+                try:
+                    st = de.stat(follow_symlinks=False)
+                except OSError as e:
+                    self._skip(os.path.relpath(full, root), e)
+                    continue
+                yield full, kind, st
+                if kind == KIND_DIR:
+                    subdirs.append(full)
+            for d in subdirs:
+                yield from visit(d)
+        yield from visit(root)
 
     def _skip(self, rel: str, e: BaseException):
         reason = getattr(e, "strerror", None) or str(e) or type(e).__name__
         self.stats.skipped.append((_norm_path(rel), reason))
 
-    def _add_special(self, rel: str, full: str, kind: int):
+    def _add_special(self, rel: str, full: str, kind: int, st: os.stat_result | None = None):
         """A directory or symlink entry (no file data read)."""
-        st = os.lstat(full)
+        st = st or os.lstat(full)
         e = FileEntry(_norm_path(rel), 0, EMPTY_SHA, kind=kind)
         e.mtime_ns, e.mode, e.attrs = _meta(st)
         if kind in (KIND_LINK, KIND_DIRLINK):
@@ -983,10 +1008,31 @@ class StoreWriter:
             self.stats.dirs += 1
         self.entries.append(e)
 
-    def add_tree(self, root: str, use_dictionary: bool | None = None, sample_budget: int = 8 << 20):
+    def _previous_files(self, label: str) -> dict[str, FileEntry]:
+        """Files of the newest earlier snapshot of the same source folder that
+        are safe to reuse by size + mtime: recorded in a v3 manifest, and not
+        modified within RACY_NS of that snapshot being taken (a write in the
+        same timestamp tick as the read could otherwise go unnoticed)."""
+        want = os.path.normcase(label)
+        for s in reversed(self.prev_snapshots):
+            if os.path.normcase(s.label) == want:
+                if s.version < 3:
+                    return {}
+                limit = s.created * 1_000_000_000 - RACY_NS
+                return {e.path: e for e in s.entries
+                        if e.kind == KIND_FILE and 0 <= e.mtime_ns < limit}
+        return {}
+
+    def add_tree(self, root: str, use_dictionary: bool | None = None, sample_budget: int = 8 << 20,
+                 rehash: bool = False):
         """Back up a directory tree. A file that cannot be read (locked by
         another program, permission denied, vanished) is skipped and listed
-        in stats.skipped and the manifest instead of failing the whole run."""
+        in stats.skipped and the manifest instead of failing the whole run.
+
+        Unchanged files are not read again: a file whose size and mtime match
+        the previous snapshot of the same folder reuses that snapshot's chunk
+        list (its current mtime / permissions / attributes are still
+        recorded). rehash=True reads and hashes every file regardless."""
         # A dictionary pays off when chunks are compressed alone; with large
         # solid packs it mostly costs its own size, so default to it only then.
         if use_dictionary is None:
@@ -994,7 +1040,15 @@ class StoreWriter:
         if not self.label:
             self.label = os.path.abspath(root)
         items = list(self._walk(root))
-        files = [full for full, kind in items if kind == KIND_FILE]
+        reuse: dict[str, FileEntry] = {}
+        prev = {} if rehash else self._previous_files(os.path.abspath(root))
+        if prev:
+            for full, kind, st in items:
+                if kind == KIND_FILE:
+                    p = prev.get(_norm_path(os.path.relpath(full, root)))
+                    if p is not None and p.size == st.st_size and p.mtime_ns == st.st_mtime_ns:
+                        reuse[full] = p
+        files = [full for full, kind, _ in items if kind == KIND_FILE and full not in reuse]
         if use_dictionary and self.created and self.pos == len(STORE_MAGIC):
             seen, samples, budget = set(), [], sample_budget
             for full in files:
@@ -1015,11 +1069,22 @@ class StoreWriter:
                     break
             self.train_dictionary(samples)
         prepared = self._prepared(files)
-        for full, kind in items:
+        st_ = self.stats
+        for full, kind, fst in items:
             rel = os.path.relpath(full, root)
             try:
                 if kind != KIND_FILE:
-                    self._add_special(rel, full, kind)
+                    self._add_special(rel, full, kind, fst)
+                    continue
+                p = reuse.get(full)
+                if p is not None:
+                    e = FileEntry(_norm_path(rel), p.size, p.sha256, p.pointers)
+                    e.mtime_ns, e.mode, e.attrs = _meta(fst)
+                    self.entries.append(e)
+                    st_.files += 1
+                    st_.input_bytes += p.size
+                    st_.reused_files += 1
+                    st_.reused_bytes += p.size
                     continue
                 pfull, res = next(prepared)
                 assert pfull == full
@@ -1091,7 +1156,7 @@ class StoreWriter:
         digests = b"".join(d for d, _ in self.new_index)
         ptrs = np.asarray([p for _, p in self.new_index], dtype="<u8").tobytes()
         parts = [MANIFEST_V3,
-                 struct.pack("<QQH", self.prev_manifest, int(time.time()), len(label)), label,
+                 struct.pack("<QQH", self.prev_manifest, int(self.started), len(label)), label,
                  struct.pack("<II", self.first_new_pack, len(new_packs)),
                  np.asarray(new_packs, dtype="<u8").tobytes(),
                  struct.pack("<I", len(self.new_index)), digests, ptrs,
@@ -1532,6 +1597,8 @@ def _fmt(st: Stats) -> str:
     r = st.input_bytes / st.store_bytes if st.store_bytes else 0
     return (f"snapshot={st.snapshot} files={st.files} input={st.input_bytes:,}B "
             f"added={st.added_bytes:,}B store={st.store_bytes:,}B ratio={r:.2f}x\n"
+            f"unchanged files reused={st.reused_files} ({st.reused_bytes:,}B not read) "
+            f"dirs={st.dirs} links={st.links}\n"
             f"chunks total={st.chunks_total} unique={st.chunks_unique} dedup_saved={st.dedup_bytes:,}B "
             f"packs={st.packs}\n"
             f"media_files={st.media_files} near_dup_images={st.near_dup_images} "
@@ -1540,7 +1607,8 @@ def _fmt(st: Stats) -> str:
             f"manifest={st.manifest_bytes:,}B")
 
 
-def _write(store: str, src: str, append: bool, level: int = 19, workers: int | None = None) -> int:
+def _write(store: str, src: str, append: bool, level: int = 19, workers: int | None = None,
+           rehash: bool = False) -> int:
     if not os.path.isdir(src):
         print(f"error: {src} is not a directory", file=sys.stderr)
         return 2
@@ -1550,14 +1618,15 @@ def _write(store: str, src: str, append: bool, level: int = 19, workers: int | N
         print(f"note: discarded {w.recovered_bytes:,} bytes left by an interrupted earlier run",
               file=sys.stderr)
     try:
-        w.add_tree(src)
+        w.add_tree(src, rehash=rehash)
         st = w.close()
     except BaseException:
         w.abort()
         raise
     dt = time.time() - t0
     print(_fmt(st))
-    print(f"time={dt:.1f}s ({st.input_bytes / 1e6 / dt if dt else 0:.1f} MB/s)")
+    read = st.input_bytes - st.reused_bytes
+    print(f"time={dt:.1f}s (read {read / 1e6:.1f} MB at {read / 1e6 / dt if dt else 0:.1f} MB/s)")
     if st.skipped:
         _print_skipped(st.skipped)
         return 3
@@ -1585,6 +1654,9 @@ def main(argv) -> int:
                        help="zstd level 1-22 (default 19; 9 is ~15x faster for ~10%% less ratio)")
         p.add_argument("--workers", type=int, default=None,
                        help="threads (default: CPU count, max 16; 1 = single-threaded)")
+        if name == "backup":
+            p.add_argument("--rehash", action="store_true",
+                           help="read every file, even ones whose size and mtime are unchanged")
     p = sub.add_parser("list", help="list snapshots")
     p.add_argument("store")
     p.add_argument("--skipped", action="store_true", help="also list items each snapshot could not read")
@@ -1601,7 +1673,8 @@ def main(argv) -> int:
         if a.cmd == "pack":
             return _write(a.store, a.input_dir, append=False, level=a.level, workers=a.workers)
         if a.cmd == "backup":
-            return _write(a.store, a.input_dir, append=True, level=a.level, workers=a.workers)
+            return _write(a.store, a.input_dir, append=True, level=a.level, workers=a.workers,
+                          rehash=a.rehash)
         with StoreReader(a.store) as r:
             if a.cmd == "list":
                 print(f"{'#':>3}  {'created':19}  {'files':>7}  {'bytes':>15}  {'skipped':>7}  source")
