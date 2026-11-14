@@ -177,6 +177,27 @@ the earlier read. The new entry records the file's current `mtime_ns`,
 Limitation: content changed while both size and mtime stay exactly the same
 (some tools restore mtimes) is not seen until a `--rehash` run.
 
+### Pruning (rewriting a store without some snapshots)
+
+The format is append-only, so deleting snapshots writes a new store. It
+keeps the same layout and moves kept snapshots in order:
+
+* The dictionary block, if any, is copied first.
+* For each kept snapshot, every pack it is the first kept snapshot to use is
+  emitted before its manifest:
+  * as the original block, byte-for-byte (its pack id changes and chunk
+    indexes stay the same), or
+  * with only its live chunks re-encoded into new packs. MEDIA and
+    non-media chunks are never mixed.
+* Each rewritten manifest:
+  * has its pointers remapped;
+  * keeps `created`, `label`, entries' metadata and the skipped list;
+  * has `prev` pointing at the previous kept manifest;
+  * has an index that lists every chunk in its own packs.
+* Older snapshots (v1/v2) are rewritten as v3.
+
+The new store must pass a full `verify` before it is renamed over the old one.
+
 ## 5. Restoring a snapshot
 
 1. **Paths:** split each path on `/` or `\`. Reject the path if any part is

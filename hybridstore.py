@@ -37,6 +37,8 @@ Usage:
   python hybridstore.py list   <store_file> [--skipped]
   python hybridstore.py unpack <store_file> <output_dir> [--snapshot N]
   python hybridstore.py verify <store_file> [--allow-partial]
+  python hybridstore.py prune  <store_file> [--remove N ...] [--keep-last N] [--keep-daily N]
+                               [--keep-weekly N] [--keep-monthly N] [--dry-run]
 
 Exit codes: 0 ok, 1 integrity error, 3 finished with warnings (items skipped /
 symlinks not restored), 4 store locked by another backup. Format: FORMAT.md.
@@ -653,6 +655,32 @@ def _decode_pack(payload: bytes) -> list[bytes]:
     return out
 
 
+def _build_manifest(prev: int, created: int, label: str, first_pack: int, packs: list[int],
+                    index: list[tuple[bytes, int]], entries: list[FileEntry],
+                    skipped: list[tuple[str, str]]) -> bytes:
+    """Serialize a v3 manifest (see FORMAT.md)."""
+    lab = label.encode("utf-8", "surrogateescape")[:65535]
+    parts = [MANIFEST_V3,
+             struct.pack("<QQH", prev, created, len(lab)), lab,
+             struct.pack("<II", first_pack, len(packs)),
+             np.asarray(packs, dtype="<u8").tobytes(),
+             struct.pack("<I", len(index)), b"".join(d for d, _ in index),
+             np.asarray([p for _, p in index], dtype="<u8").tobytes(),
+             struct.pack("<I", len(entries))]
+    for e in entries:
+        p = e.path.encode("utf-8", "surrogateescape")[:65535]
+        parts.append(struct.pack("<H", len(p)) + p)
+        parts.append(_ENTRY3.pack(e.kind, e.size, e.sha256, e.mtime_ns, e.mode & 0xFFFFFFFF,
+                                  e.attrs & 0xFFFFFFFF, len(e.pointers)))
+        parts.append(np.asarray(e.pointers, dtype="<u8").tobytes())
+    parts.append(struct.pack("<I", len(skipped)))
+    for path, reason in skipped:
+        p = path.encode("utf-8", "surrogateescape")[:65535]
+        r = reason.encode("utf-8", "replace")[:65535]
+        parts.append(struct.pack("<H", len(p)) + p + struct.pack("<H", len(r)) + r)
+    return b"".join(parts)
+
+
 def _norm_path(rel: str) -> str:
     return rel.replace(os.sep, "/") if os.sep != "/" else rel
 
@@ -978,7 +1006,10 @@ class StoreWriter:
             for _, kind, de in dirs + files:
                 full = de.path
                 try:
-                    st = de.stat(follow_symlinks=False)
+                    # Files: the listing's cached stat is only a prefilter for reuse
+                    # (add_tree re-stats candidates); NTFS updates it lazily.
+                    # Directories / links: always an exact lstat, since it is stored.
+                    st = de.stat(follow_symlinks=False) if kind == KIND_FILE else os.lstat(full)
                 except OSError as e:
                     self._skip(os.path.relpath(full, root), e)
                     continue
@@ -1040,14 +1071,19 @@ class StoreWriter:
         if not self.label:
             self.label = os.path.abspath(root)
         items = list(self._walk(root))
-        reuse: dict[str, FileEntry] = {}
+        reuse: dict[str, tuple[FileEntry, os.stat_result]] = {}
         prev = {} if rehash else self._previous_files(os.path.abspath(root))
         if prev:
             for full, kind, st in items:
                 if kind == KIND_FILE:
                     p = prev.get(_norm_path(os.path.relpath(full, root)))
                     if p is not None and p.size == st.st_size and p.mtime_ns == st.st_mtime_ns:
-                        reuse[full] = p
+                        try:
+                            st = os.lstat(full)     # exact values (the listing's may be stale)
+                        except OSError:
+                            continue                # read normally; any error is reported there
+                        if p.size == st.st_size and p.mtime_ns == st.st_mtime_ns:
+                            reuse[full] = (p, st)
         files = [full for full, kind, _ in items if kind == KIND_FILE and full not in reuse]
         if use_dictionary and self.created and self.pos == len(STORE_MAGIC):
             seen, samples, budget = set(), [], sample_budget
@@ -1076,10 +1112,11 @@ class StoreWriter:
                 if kind != KIND_FILE:
                     self._add_special(rel, full, kind, fst)
                     continue
-                p = reuse.get(full)
-                if p is not None:
+                hit = reuse.get(full)
+                if hit is not None:
+                    p, exact = hit
                     e = FileEntry(_norm_path(rel), p.size, p.sha256, p.pointers)
-                    e.mtime_ns, e.mode, e.attrs = _meta(fst)
+                    e.mtime_ns, e.mode, e.attrs = _meta(exact)
                     self.entries.append(e)
                     st_.files += 1
                     st_.input_bytes += p.size
@@ -1151,28 +1188,9 @@ class StoreWriter:
             self._drain()
         finally:
             self._shutdown()
-        new_packs = self.pack_offsets[self.first_new_pack:]
-        label = self.label.encode("utf-8")[:65535]
-        digests = b"".join(d for d, _ in self.new_index)
-        ptrs = np.asarray([p for _, p in self.new_index], dtype="<u8").tobytes()
-        parts = [MANIFEST_V3,
-                 struct.pack("<QQH", self.prev_manifest, int(self.started), len(label)), label,
-                 struct.pack("<II", self.first_new_pack, len(new_packs)),
-                 np.asarray(new_packs, dtype="<u8").tobytes(),
-                 struct.pack("<I", len(self.new_index)), digests, ptrs,
-                 struct.pack("<I", len(self.entries))]
-        for e in self.entries:
-            p = e.path.encode("utf-8", "surrogateescape")[:65535]
-            parts.append(struct.pack("<H", len(p)) + p)
-            parts.append(_ENTRY3.pack(e.kind, e.size, e.sha256, e.mtime_ns, e.mode & 0xFFFFFFFF,
-                                      e.attrs & 0xFFFFFFFF, len(e.pointers)))
-            parts.append(np.asarray(e.pointers, dtype="<u8").tobytes())
-        parts.append(struct.pack("<I", len(self.stats.skipped)))
-        for path, reason in self.stats.skipped:
-            p = path.encode("utf-8", "surrogateescape")[:65535]
-            r = reason.encode("utf-8", "replace")[:65535]
-            parts.append(struct.pack("<H", len(p)) + p + struct.pack("<H", len(r)) + r)
-        manifest = b"".join(parts)
+        manifest = _build_manifest(self.prev_manifest, int(self.started), self.label, self.first_new_pack,
+                                   self.pack_offsets[self.first_new_pack:], self.new_index,
+                                   self.entries, self.stats.skipped)
         block, _ = self.codec.encode(manifest, FLAG_MANIFEST)
         moff = self.pos
         self.f.write(block)
@@ -1593,6 +1611,230 @@ class StoreReader:
         self.close()
 
 
+# --------------------------------------------------------------------------
+# Deleting snapshots (prune)
+# --------------------------------------------------------------------------
+def select_snapshots(snaps: list[Snapshot], keep_last: int = 0, keep_daily: int = 0,
+                     keep_weekly: int = 0, keep_monthly: int = 0) -> set[int]:
+    """1-based numbers of the snapshots a retention policy keeps. Rules are
+    applied per source folder (label), newest first, and their results are
+    combined: keep_last N keeps the N newest; keep_daily N keeps the newest
+    snapshot of each of the N most recent days that have one (local time);
+    weekly uses ISO weeks, monthly calendar months."""
+    import datetime
+    groups: dict[str, list[int]] = {}
+    for i, s in enumerate(snaps, 1):
+        groups.setdefault(os.path.normcase(s.label), []).append(i)
+    keep: set[int] = set()
+    bucket = {"day": lambda d: d.isoformat(), "week": lambda d: d.isocalendar()[:2],
+              "month": lambda d: (d.year, d.month)}
+    for ids in groups.values():
+        newest = sorted(ids, key=lambda i: (snaps[i - 1].created, i), reverse=True)
+        keep.update(newest[:max(keep_last, 0)])
+        for n, kind in ((keep_daily, "day"), (keep_weekly, "week"), (keep_monthly, "month")):
+            seen = set()
+            for i in newest:
+                k = bucket[kind](datetime.date.fromtimestamp(snaps[i - 1].created))
+                if k not in seen:
+                    if len(seen) >= n:
+                        break
+                    seen.add(k)
+                    keep.add(i)
+    return keep
+
+
+@dataclass
+class PruneStats:
+    kept: list[int]
+    removed: list[int]
+    bytes_before: int = 0
+    bytes_after: int = 0
+    packs_copied: int = 0       # still fully (or mostly) used: copied byte-for-byte
+    packs_repacked: int = 0     # mostly unused: live chunks recompressed into new packs
+    packs_dropped: int = 0      # no kept snapshot uses them
+    new_packs: int = 0          # packs written by repacking
+    dry_run: bool = False
+
+
+def prune(path: str, remove, repack_below: float = 0.5, level: int = 19, dry_run: bool = False,
+          workers: int | None = None) -> PruneStats:
+    """Delete the given 1-based snapshots and reclaim their space.
+
+    The store is rewritten to '<path>.hcs-new' under the store lock: kept
+    snapshots keep their order, labels, times and skipped lists (snapshot
+    numbers shift down). Packs no kept snapshot uses are dropped; a pack
+    whose live bytes are at least `repack_below` of its contents is copied
+    byte-for-byte; the live chunks of sparser packs are recompressed into new
+    packs. The new store is fully verified before it replaces the old one,
+    so an error or crash at any point leaves the original untouched. Needs
+    free space for the new store next to the old one."""
+    remove = set(remove)
+    lock = _StoreLock(path)
+    out = path + ".hcs-new"
+    try:
+        with StoreReader(path, load_index=True) as r:
+            snaps = r.snapshots
+            bad = sorted(i for i in remove if not 1 <= i <= len(snaps))
+            if bad:
+                raise ValueError(f"snapshot(s) {bad} do not exist (store has {len(snaps)})")
+            kept = [i for i in range(1, len(snaps) + 1) if i not in remove]
+            if not kept:
+                raise ValueError("refusing to remove every snapshot")
+            ps = PruneStats(kept, sorted(remove), bytes_before=r.end, bytes_after=r.end, dry_run=dry_run)
+            if not remove:
+                return ps
+
+            digest: dict[int, bytes] = {}
+            for s in snaps:
+                if s.version >= 2:
+                    d = s.index_digests
+                    for k, p in enumerate(s.index_ptrs):
+                        digest[p] = d[32 * k:32 * k + 32]
+            n_chunks: dict[int, int] = {}
+            for p in digest:
+                n_chunks[p >> PTR_SHIFT] = n_chunks.get(p >> PTR_SHIFT, 0) + 1
+            used: dict[int, set[int]] = {}
+            for i in kept:
+                for e in snaps[i - 1].entries:
+                    for p in e.pointers:
+                        used.setdefault(p >> PTR_SHIFT, set()).add(p & PTR_IDX_MASK)
+
+            def raw_block(off):
+                slen = HDR.unpack(r._read(off, HDR.size))[3]
+                return r._read(off, HDR.size + slen)
+
+            # Decide, per live pack, copy or repack (in first-use order per kept snapshot).
+            mode: dict[int, str] = {}
+            plan: list[list[int]] = []
+            for i in kept:
+                order = []
+                for e in snaps[i - 1].entries:
+                    for p in e.pointers:
+                        pid = p >> PTR_SHIFT
+                        if pid not in mode:
+                            total = n_chunks.get(pid)
+                            if total is not None and len(used[pid]) >= total:
+                                mode[pid] = "copy"
+                            else:
+                                chunks = r._pack(pid)
+                                live = sum(len(chunks[k]) for k in used[pid])
+                                full = sum(map(len, chunks)) or 1
+                                mode[pid] = "copy" if live / full >= repack_below else "repack"
+                            order.append(pid)
+                plan.append(order)
+            ps.packs_copied = sum(m == "copy" for m in mode.values())
+            ps.packs_repacked = sum(m == "repack" for m in mode.values())
+            ps.packs_dropped = len(r.pack_offsets) - len(mode)
+            if dry_run:
+                dropped = sum(len(raw_block(r.pack_offsets[pid])) for pid in range(len(r.pack_offsets))
+                              if pid not in mode)
+                ps.bytes_after = r.end - dropped            # estimate: ignores repack savings
+                return ps
+
+            codec = BlockCodec(zstd_level=level)
+            nw = max(1, workers if workers is not None else min(os.cpu_count() or 1, 16))
+            pool = ThreadPoolExecutor(nw, thread_name_prefix="hcs-prune") if nw > 1 else None
+            f = open(out, "wb")
+            try:
+                f.write(STORE_MAGIC)
+                pos = len(STORE_MAGIC)
+                if r.has_dict:
+                    blk = raw_block(len(STORE_MAGIC))
+                    f.write(blk); pos += len(blk)
+                    codec.set_dictionary(r._block(len(STORE_MAGIC))[0])
+                new_offsets: list[int] = []
+                remap: dict[int, int] = {}
+                prev = 0
+                for j, i in enumerate(kept):
+                    s = snaps[i - 1]
+                    first = len(new_offsets)
+                    new_index: list[tuple[bytes, int]] = []
+                    pending: deque = deque()     # ("copy", raw, pid, count) | ("repack", future, [(old_ptr, digest)])
+
+                    def write_one():
+                        nonlocal pos
+                        kind, a, b, *rest = pending.popleft()
+                        npid = len(new_offsets)
+                        new_offsets.append(pos)
+                        if kind == "copy":
+                            f.write(a); pos += len(a)
+                            for k in range(rest[0]):
+                                op, np_ = (b << PTR_SHIFT) | k, (npid << PTR_SHIFT) | k
+                                remap[op] = np_
+                                new_index.append((digest.get(op) or hashlib.sha256(r._chunk(op)).digest(), np_))
+                        else:
+                            blk = a.result()[0] if pool else a
+                            f.write(blk); pos += len(blk)
+                            ps.new_packs += 1
+                            for k, (op, dg) in enumerate(b):
+                                remap[op] = (npid << PTR_SHIFT) | k
+                                new_index.append((dg, (npid << PTR_SHIFT) | k))
+
+                    batches: dict[int, list] = {}     # pack flags -> [(old_ptr, digest, chunk)]
+
+                    def submit(flags):
+                        items = batches.pop(flags)
+                        payload = _encode_pack([c for _, _, c in items])
+                        job = pool.submit(codec.encode, payload, flags) if pool else codec.encode(payload, flags)[0]
+                        pending.append(("repack", job, [(op, dg) for op, dg, _ in items]))
+                        while len(pending) > 4 * nw:
+                            write_one()
+
+                    for pid in plan[j]:
+                        off = r.pack_offsets[pid]
+                        if mode[pid] == "copy":
+                            blk = raw_block(off)
+                            count = n_chunks.get(pid) or len(r._pack(pid))
+                            pending.append(("copy", blk, pid, count))
+                            while len(pending) > 4 * nw:
+                                write_one()
+                            continue
+                        flags = HDR.unpack(r._read(off, HDR.size))[1] & FLAG_MEDIA
+                        chunks = r._pack(pid)
+                        for k in sorted(used[pid]):
+                            op = (pid << PTR_SHIFT) | k
+                            dg = digest.get(op) or hashlib.sha256(chunks[k]).digest()
+                            b = batches.setdefault(flags, [])
+                            b.append((op, dg, chunks[k]))
+                            if sum(len(c) for _, _, c in b) >= 1 << 20 or len(b) >= PTR_IDX_MASK:
+                                submit(flags)
+                    for flags in list(batches):
+                        submit(flags)
+                    while pending:
+                        write_one()
+                    entries = [FileEntry(e.path, e.size, e.sha256, [remap[p] for p in e.pointers],
+                                         e.kind, e.mtime_ns, e.mode, e.attrs) for e in s.entries]
+                    manifest = _build_manifest(prev, s.created, s.label, first, new_offsets[first:],
+                                               new_index, entries, s.skipped)
+                    block, _ = codec.encode(manifest, FLAG_MANIFEST)
+                    moff = pos
+                    f.write(block); pos += len(block)
+                    f.write(FOOTER.pack(moff, STORE_MAGIC)); pos += FOOTER.size
+                    prev = moff
+                f.flush(); os.fsync(f.fileno())
+            finally:
+                f.close()
+                if pool:
+                    pool.shutdown(wait=True)
+        # Prove the new store before it replaces the old one.
+        with StoreReader(out) as r2:
+            if len(r2.snapshots) != len(kept):
+                raise IntegrityError("pruned store has the wrong number of snapshots")
+            r2.verify()
+        os.replace(out, path)
+        ps.bytes_after = os.path.getsize(path)
+        return ps
+    except BaseException:
+        try:
+            if os.path.exists(out):
+                os.remove(out)
+        except OSError:
+            pass
+        raise
+    finally:
+        lock.release()
+
+
 def _fmt(st: Stats) -> str:
     r = st.input_bytes / st.store_bytes if st.store_bytes else 0
     return (f"snapshot={st.snapshot} files={st.files} input={st.input_bytes:,}B "
@@ -1633,6 +1875,39 @@ def _write(store: str, src: str, append: bool, level: int = 19, workers: int | N
     return 0
 
 
+def _prune_cli(a) -> int:
+    policy = a.keep_last or a.keep_daily or a.keep_weekly or a.keep_monthly
+    if not policy and not a.remove:
+        print("error: say what to delete: --remove N... and/or a --keep-* policy", file=sys.stderr)
+        return 2
+    with StoreReader(a.store) as r:
+        snaps = r.snapshots
+        remove = set(a.remove)
+        if policy:
+            keep = select_snapshots(snaps, a.keep_last, a.keep_daily, a.keep_weekly, a.keep_monthly)
+            remove |= set(range(1, len(snaps) + 1)) - keep
+    if not remove:
+        print("nothing to delete: every snapshot is kept by the policy")
+        return 0
+    t0 = time.time()
+    ps = prune(a.store, remove, repack_below=a.repack_below, level=a.level, dry_run=a.dry_run,
+               workers=a.workers)
+    for i in range(1, len(snaps) + 1):
+        s = snaps[i - 1]
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(s.created)) if s.created else "(v1)"
+        print(f"{'delete' if i in remove else 'keep  '} #{i:<3} {when}  {len(s.files):>7} files  {s.label}")
+    verb = "would be" if ps.dry_run else "were"
+    print(f"packs: {ps.packs_copied} kept as-is, {ps.packs_repacked} repacked into {ps.new_packs} new, "
+          f"{ps.packs_dropped} dropped")
+    saved = ps.bytes_before - ps.bytes_after
+    print(f"store {ps.bytes_before:,} -> {ps.bytes_after:,} bytes ({saved:,} {verb} freed"
+          f"{', not counting repacking' if ps.dry_run else ''}); {len(ps.removed)} snapshot(s) {verb} deleted")
+    if not ps.dry_run:
+        print(f"new store verified; remaining snapshots renumbered 1..{len(ps.kept)}; "
+              f"time={time.time() - t0:.1f}s")
+    return 0
+
+
 def _print_skipped(skipped, limit=50):
     print(f"warning: {len(skipped)} item(s) could not be read and are NOT in this snapshot:",
           file=sys.stderr)
@@ -1663,6 +1938,20 @@ def main(argv) -> int:
     p = sub.add_parser("unpack", help="restore a snapshot (default: newest)")
     p.add_argument("store"); p.add_argument("output_dir")
     p.add_argument("--snapshot", type=int, default=None, help="1-based snapshot number")
+    p = sub.add_parser("prune", help="delete snapshots and reclaim their space (by number and/or policy)")
+    p.add_argument("store")
+    p.add_argument("--remove", type=int, nargs="+", default=[], metavar="N",
+                   help="snapshot numbers to delete (as shown by `list`)")
+    for opt, hlp in (("--keep-last", "keep the N newest snapshots"),
+                     ("--keep-daily", "keep the newest snapshot of each of the last N days that have one"),
+                     ("--keep-weekly", "same, per ISO week"),
+                     ("--keep-monthly", "same, per calendar month")):
+        p.add_argument(opt, type=int, default=0, metavar="N", help=hlp + " (per source folder)")
+    p.add_argument("--dry-run", action="store_true", help="show what would be deleted; change nothing")
+    p.add_argument("--repack-below", type=float, default=0.5, metavar="F",
+                   help="recompress packs whose live fraction is below F (default 0.5); 0 = never")
+    p.add_argument("--level", type=int, default=19, help="zstd level for repacked data (default 19)")
+    p.add_argument("--workers", type=int, default=None, help="compression threads")
     p = sub.add_parser("verify", help="check the whole store: layout, every block, index and file")
     p.add_argument("store")
     p.add_argument("--allow-partial", action="store_true",
@@ -1675,6 +1964,8 @@ def main(argv) -> int:
         if a.cmd == "backup":
             return _write(a.store, a.input_dir, append=True, level=a.level, workers=a.workers,
                           rehash=a.rehash)
+        if a.cmd == "prune":
+            return _prune_cli(a)
         with StoreReader(a.store) as r:
             if a.cmd == "list":
                 print(f"{'#':>3}  {'created':19}  {'files':>7}  {'bytes':>15}  {'skipped':>7}  source")

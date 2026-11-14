@@ -432,6 +432,84 @@ def _():
     assert hs.main(["backup", src, store, "--rehash"]) == 0
 
 
+@check("prune deletes snapshots, reclaims space (copy + repack), keeps the rest bit-exact")
+def _():
+    base = os.path.join(TMP, "prune")
+    shared = {f"lib/s{i}.txt": text(40_000, 900 + i) for i in range(40)}
+    for dictionary in (False, True):
+        store = os.path.join(TMP, f"prune{int(dictionary)}.hcs")
+        trees = []
+        for k in range(4):                           # each night: shared files + small and big unique ones
+            src = f"{base}{int(dictionary)}_{k}"
+            files = dict(shared)
+            files.update({f"night/n{k}_{i}.txt": text(5_000, 1000 * k + i) for i in range(30)})
+            files[f"night/big{k}.bin"] = os.urandom(1_500_000)
+            tree(src, files); trees.append(src)
+            # one source folder over time: copy into a fixed path so all snapshots share a label
+            live = f"{base}{int(dictionary)}_live"
+            shutil.rmtree(live, ignore_errors=True); shutil.copytree(src, live)
+            w = hs.StoreWriter(store, append=True, pack_target=16 << 10 if dictionary else 1 << 20)
+            w.add_tree(live); w.close()
+        before = os.path.getsize(store)
+        with hs.StoreReader(store) as r:
+            old = [(s.label, s.created) for s in r.snapshots]
+            assert r.has_dict == dictionary
+        # without a dictionary: repack every partly-used pack, to exercise that path
+        ps = hs.prune(store, {1, 3}, workers=4, repack_below=0.5 if dictionary else 1.0)
+        assert ps.kept == [2, 4] and ps.removed == [1, 3], ps
+        assert ps.packs_dropped > 0 and os.path.getsize(store) < before - 2_500_000, (before, ps)
+        if not dictionary:
+            assert ps.packs_repacked > 0, ps         # packs mixing night-1 and shared chunks
+        with hs.StoreReader(store) as r:
+            assert [(s.label, s.created) for s in r.snapshots] == [old[1], old[3]]
+            assert r.verify() == 2 * 71
+            for n, src in ((1, trees[1]), (2, trees[3])):
+                out = os.path.join(TMP, f"prune_out{int(dictionary)}{n}")
+                r.unpack(out, snapshot=n); same_tree(src, out)
+    # the next backup still dedups against what is left and reuses unchanged files
+    old_ns = int(__import__("time").time() - 3600) * 10**9
+    for d, _, fs in os.walk(live):
+        for name in fs:
+            os.utime(os.path.join(d, name), ns=(old_ns, old_ns))
+    w = hs.StoreWriter(store, append=True); w.add_tree(live); w.close()        # records the old mtimes
+    w = hs.StoreWriter(store, append=True); w.add_tree(live); st = w.close()
+    assert st.reused_files == 71 and st.chunks_unique == 0, st
+    hs.prune(store, {1})
+    with hs.StoreReader(store) as r:
+        assert len(r.snapshots) == 3 and r.verify() == 3 * 71
+
+
+@check("prune policies, dry run and refusals")
+def _():
+    import datetime
+    def snap(label, y, m, d, h=12):
+        return hs.Snapshot(0, 3, 0, int(datetime.datetime(y, m, d, h).timestamp()), label, 0, [], [])
+    snaps = [snap("A", 2026, 9, 1), snap("A", 2026, 10, 3), snap("A", 2026, 10, 30), snap("A", 2026, 11, 2),
+             snap("A", 2026, 11, 2, 18), snap("A", 2026, 11, 3), snap("B", 2026, 1, 1)]
+    assert hs.select_snapshots(snaps, keep_last=2) == {5, 6, 7}
+    assert hs.select_snapshots(snaps, keep_daily=2) == {5, 6, 7}         # Nov 3, newest of Nov 2; B kept too
+    assert hs.select_snapshots(snaps, keep_monthly=3) == {6, 3, 1, 7}
+    assert hs.select_snapshots(snaps, keep_last=1, keep_weekly=2) == {6, 3, 7}   # Nov 2 + 3 share a week
+    store = os.path.join(TMP, "prune0.hcs")
+    data = open(store, "rb").read()
+    ps = hs.prune(store, {1}, dry_run=True)
+    assert ps.dry_run and ps.packs_dropped >= 0 and open(store, "rb").read() == data
+    assert hs.main(["prune", store, "--keep-last", "5", "--dry-run"]) == 0
+    for bad in ({1, 2}, {9}):
+        try:
+            hs.prune(store, bad); raise AssertionError(bad)
+        except ValueError:
+            pass
+    w = hs.StoreWriter(store, append=True)
+    try:
+        hs.prune(store, {1}); raise AssertionError("prune ran while a backup held the lock")
+    except hs.StoreLockedError:
+        pass
+    finally:
+        w.abort()
+    assert open(store, "rb").read() == data and not os.path.exists(store + ".hcs-new")
+
+
 @check("a failed `pack` over an existing store leaves the old store untouched")
 def _():
     store = os.path.join(TMP, "lock.hcs")

@@ -17,7 +17,7 @@ It lists five Phase I bugs and Phase II fixes: a naive XOR boundary test (fix: a
 | `hybridstore.py` | The engine and CLI (commands below) |
 | `bench.py` | Builds the sample datasets, checks round trips, runs an incremental-backup run and the corruption test, compares against baselines |
 | `bench_large.py` | Packs, verifies and restores one large file (default 2 GiB) and reports peak memory |
-| `test_hybridstore.py` | 18 checks: streaming, snapshots, v1 compatibility, crash recovery, path safety, large media, locking, skipped files, strict verify, decompression bombs, metadata, unchanged-file reuse |
+| `test_hybridstore.py` | 20 checks: streaming, snapshots, v1 compatibility, crash recovery, path safety, large media, locking, skipped files, strict verify, decompression bombs, metadata, unchanged-file reuse, prune (copy/repack/dictionary, policies, dry run, refusals) |
 | `FORMAT.md` | Byte-level specification of the store format |
 | `hybridstore.cmd` | Windows launcher that uses the local `.venv` |
 | `bench_results.txt` | Output of the original benchmark run (Linux container, v1 engine) |
@@ -86,7 +86,7 @@ These fixes address the problems found in the 2026-11-14 probes and fuzzing:
 * **Portable paths.** Manifest paths always use `/`. Unpack accepts `/` or `\`, so stores move between Windows and Linux, and it rejects `..`, empty components and (on Windows) drive letters or `:`.
 * **v1 stores** still read. `backup` can append to them; the first time, it rebuilds the index by hashing their chunks once.
 
-Not done yet: removing old snapshots (needs reference counts and a compaction pass).
+Removing old snapshots: see `prune` below.
 
 ### Speed (multi-threaded packing)
 
@@ -173,9 +173,35 @@ When each ~8 KiB chunk was compressed on its own, the result lost badly to plain
   * Only snapshots of the same source folder are compared, so two different folders backed up into one store never borrow from each other.
 * **Limitation:** content changed while both size and time stay exactly the same is only picked up by `backup --rehash`. Some copy tools preserve times, so run `--rehash` now and then, for example monthly.
 
+* **Windows detail:** NTFS updates the size and time it reports in directory listings lazily, so a file still being written can show stale values there. The listing is therefore only a first filter. Every file it says is unchanged is confirmed with an exact `lstat` before it is reused. This costs about 0.1 s per 2,500 unchanged files. Folders and links always get an exact `lstat`, because their metadata is stored.
+
+### Deleting snapshots: `prune` (Phase 2, step 2)
+
+```
+python hybridstore.py prune <store> --remove 3 5            # delete snapshots 3 and 5
+python hybridstore.py prune <store> --keep-daily 7 --keep-weekly 4 --keep-monthly 12
+python hybridstore.py prune <store> --keep-last 10 --dry-run   # show what would go; change nothing
+```
+
+* **Choosing what to delete.** Give snapshot numbers with `--remove`, a retention policy, or both.
+  * The policy keeps the N newest snapshots (`--keep-last`), and the newest snapshot of each of the last N days, ISO weeks or months that have one. All rules are combined.
+  * Rules apply to each source folder separately, so two folders in one store never crowd each other out.
+* **How space is reclaimed.** The store is append-only, so `prune` rewrites it to `<store>.hcs-new` while holding the store lock. Each pack (about 1 MiB of compressed chunks) is handled one of three ways:
+  * **dropped** if no kept snapshot uses it;
+  * **copied byte-for-byte** (no recompression) if at least `--repack-below` of its bytes (default 0.5) are still used;
+  * **opened, with only its live chunks recompressed** into new packs, if less than that is used.
+
+  Kept snapshots keep their source folder, time and skipped list. They are renumbered from 1.
+* **Safety.** The new store is fully verified (layout, every block, the index and every file's SHA-256) before it replaces the old one. If anything fails or the run is interrupted, the original is untouched and the temp file is removed. A backup running at the same time is refused by the lock, and vice versa.
+  * Temporary disk space needed: one copy of the pruned store.
+* **Measured on a real folder** (the project's `.venv`, 2,556 files, 81 MB):
+  * Four snapshots were taken, one of them with 40 MB of extra files.
+  * Deleting that snapshot freed **42.2 MB (64.5 MB → 22.3 MB) in 1.5 s, including full verification**.
+  * The dry run predicted the same figure beforehand.
+  * The remaining newest snapshot restored identical to the live folder.
+
 Next in Phase 2:
 
-* Delete snapshots, with refcounts and garbage collection.
 * Encryption (AES-GCM or ChaCha20-Poly1305 with Argon2id).
 * An on-disk dedup index, so the index no longer takes about 17 GB of RAM per TB of unique data.
 * Read manifests lazily.
