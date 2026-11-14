@@ -34,9 +34,12 @@ because a learned image codec is lossy and the project goal is integrity.
 Usage:
   python hybridstore.py pack   <input_dir> <store_file>       new store (overwrites)
   python hybridstore.py backup <input_dir> <store_file>       add a snapshot (creates if missing)
-  python hybridstore.py list   <store_file>
+  python hybridstore.py list   <store_file> [--skipped]
   python hybridstore.py unpack <store_file> <output_dir> [--snapshot N]
-  python hybridstore.py verify <store_file>
+  python hybridstore.py verify <store_file> [--allow-partial]
+
+Exit codes: 0 ok, 1 integrity error, 3 finished with warnings (items skipped /
+symlinks not restored), 4 store locked by another backup. Format: FORMAT.md.
 """
 from __future__ import annotations
 
@@ -45,6 +48,8 @@ import hashlib
 import io
 import os
 import re
+import socket
+import stat
 import struct
 import sys
 import threading
@@ -70,6 +75,7 @@ BLOCK_MAGIC = b"HCB"
 HDR = struct.Struct("<3sBIII")      # 16 bytes
 assert HDR.size == 16
 MANIFEST_V2 = b"HCM2"               # snapshot manifests; v1 manifests have no magic
+MANIFEST_V3 = b"HCM3"               # v2 + per-entry metadata (kind, mtime, mode, attrs) + skipped list
 
 CODEC_RAW, CODEC_ZLIB, CODEC_ZSTD, CODEC_NEURAL = 0, 1, 2, 3
 CODEC_MASK = 0x07
@@ -83,10 +89,97 @@ SEGMENT = 8 << 20                   # streaming read size
 WHOLE_MEDIA_MAX = 64 << 20          # media up to this size is stored as one object
 HASH_PIECE = 1 << 20                # per-thread piece when hashing a large segment
 PREP_MAX = 8 << 20                  # files up to this size are read+chunked in worker threads
+# Decompression limit: a block may expand to at most max(BLOCK_FLOOR, BLOCK_RATIO x its
+# stored size). Real packs are ~1 MiB and media objects <= 64 MiB, so this only stops
+# hostile or corrupt headers from making the reader allocate gigabytes.
+BLOCK_FLOOR = 256 << 20
+BLOCK_RATIO = 256
+
+# Entry kinds (manifest v3)
+KIND_FILE, KIND_DIR, KIND_LINK, KIND_DIRLINK = 0, 1, 2, 3
+# Windows attributes that are restored (read-only, hidden, system, archive, not-indexed)
+WIN_ATTR_KEEP = 0x1 | 0x2 | 0x4 | 0x20 | 0x2000
+WIN_ATTR_NORMAL = 0x80
 
 
 class IntegrityError(Exception):
     pass
+
+
+class StoreLockedError(Exception):
+    """Another process (or another writer in this process) is writing the store."""
+
+
+class _StoreLock:
+    """Exclusive OS lock on '<store>.lock', held for the whole write. The OS
+    drops it if the process dies, so a crash never leaves a stale lock."""
+
+    REGION = 1 << 20     # lock a byte past the info text, so other processes can still read it
+
+    def __init__(self, store_path: str):
+        self.path = store_path + ".lock"
+        while True:
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o644)
+            try:
+                self._lock(fd)
+            except OSError:
+                try:
+                    os.lseek(fd, 0, 0)
+                    holder = os.read(fd, 300).decode("utf-8", "replace").strip()
+                except OSError:
+                    holder = ""
+                os.close(fd)
+                raise StoreLockedError(f"{store_path} is being written by another backup"
+                                       + (f" ({holder})" if holder else "")) from None
+            try:   # the previous holder may have deleted the file between our open and lock
+                same = os.path.samestat(os.fstat(fd), os.stat(self.path))
+            except OSError:
+                same = False
+            if same:
+                break
+            self._unlock(fd); os.close(fd)
+        os.lseek(fd, 0, 0); os.ftruncate(fd, 0)
+        os.write(fd, f"pid {os.getpid()} on {socket.gethostname()} since "
+                     f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n".encode())
+        self.fd = fd
+
+    def _lock(self, fd):
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, self.REGION, 0)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock(self, fd):
+        try:
+            if os.name == "nt":
+                import msvcrt
+                os.lseek(fd, self.REGION, 0)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+
+    def release(self):
+        if self.fd is None:
+            return
+        fd, self.fd = self.fd, None
+        if os.name == "nt":
+            self._unlock(fd); os.close(fd)
+            try:
+                os.remove(self.path)       # fails harmlessly if another process has it open
+            except OSError:
+                pass
+        else:
+            try:
+                os.remove(self.path)       # unlink while still locked: no window for a second holder
+            except OSError:
+                pass
+            self._unlock(fd); os.close(fd)
 
 
 # --------------------------------------------------------------------------
@@ -389,12 +482,18 @@ class BlockCodec:
             raise IntegrityError(f"bad block magic at {off}")
         if len(payload) != slen:
             raise IntegrityError(f"truncated payload at {off}")
+        if olen > max(BLOCK_FLOOR, BLOCK_RATIO * slen):
+            raise IntegrityError(f"block at {off} claims an implausible size ({olen:,} bytes from {slen:,})")
         codec = flags & CODEC_MASK
         try:
             if codec == CODEC_RAW:
                 data = payload
             elif codec == CODEC_ZLIB:
-                data = zlib.decompress(payload)
+                # Bounded: never produce more than the header's length.
+                d = zlib.decompressobj()
+                data = d.decompress(payload, max(olen, 1))
+                if d.unconsumed_tail or not d.eof:
+                    raise IntegrityError(f"zlib stream at {off} is longer than its header says")
             elif codec == CODEC_ZSTD:
                 if not self.zd:
                     raise IntegrityError("zstd block but zstandard not installed")
@@ -450,11 +549,20 @@ class BlockCodec:
 #     | u32 n_index | n x 32-byte digest | n x u64 pointer   (chunks added here)
 #     | u32 n_files | per file: u16 len + path (utf-8, '/' separated)
 #                               | u64 size | 32-byte sha256 | u32 n | n x u64 ptr
+# v3 manifest ('HCM3', written by this version): as v2 up to n_files, then
+#     per entry: u16 len + path | u8 kind | u64 size | 32-byte sha256
+#                | i64 mtime_ns (-1 = unknown) | u32 st_mode | u32 windows attrs
+#                | u32 n | n x u64 ptr
+#     | u32 n_skipped | per skipped: u16 len + path | u16 len + reason (utf-8)
+#   kind: 0 file, 1 directory (no data), 2 symlink, 3 directory symlink; a
+#   symlink's "content" is its target path in utf-8.
 # v1 manifests (older stores) start directly with u32 n_packs and have no
 # index; appending to one rebuilds the index by hashing its chunks once.
+# See FORMAT.md for the full specification.
 # --------------------------------------------------------------------------
 PTR_SHIFT = 20
 PTR_IDX_MASK = (1 << PTR_SHIFT) - 1
+_ENTRY3 = struct.Struct("<BQ32sqIII")   # kind, size, sha256, mtime_ns, mode, attrs, n_ptrs
 
 
 @dataclass
@@ -463,6 +571,13 @@ class FileEntry:
     size: int
     sha256: bytes
     pointers: list[int] = field(default_factory=list)  # 8-byte chunk pointers
+    kind: int = KIND_FILE
+    mtime_ns: int = -1          # -1: not recorded (v1/v2 stores, add_file())
+    mode: int = 0               # st_mode; 0 = not recorded
+    attrs: int = 0              # Windows file attributes; 0 = not recorded
+
+
+EMPTY_SHA = hashlib.sha256(b"").digest()
 
 
 @dataclass
@@ -478,10 +593,15 @@ class Snapshot:
     index_digests: bytes = b""  # 32 * n
     index_ptrs: list[int] = field(default_factory=list)
     block_end: int = 0          # end of the manifest block (footer follows)
+    skipped: list[tuple[str, str]] = field(default_factory=list)   # (path, reason), v3
 
     @property
     def input_bytes(self) -> int:
-        return sum(e.size for e in self.entries)
+        return sum(e.size for e in self.entries if e.kind == KIND_FILE)
+
+    @property
+    def files(self) -> list[FileEntry]:
+        return [e for e in self.entries if e.kind == KIND_FILE]
 
 
 @dataclass
@@ -503,6 +623,9 @@ class Stats:
     manifest_bytes: int = 0
     snapshot: int = 1           # 1-based number of the snapshot just written
     added_bytes: int = 0        # bytes this run added to the store file
+    dirs: int = 0
+    links: int = 0
+    skipped: list = field(default_factory=list)   # (path, reason) of files that could not be read
 
 
 def _encode_pack(chunks: list[bytes]) -> bytes:
@@ -512,6 +635,8 @@ def _encode_pack(chunks: list[bytes]) -> bytes:
 def _decode_pack(payload: bytes) -> list[bytes]:
     try:
         (n,) = struct.unpack_from("<I", payload)
+        if 4 + 4 * n > len(payload):
+            raise struct.error("chunk count past end of pack")
         lens = struct.unpack_from(f"<{n}I", payload, 4)
     except struct.error as e:
         raise IntegrityError(f"corrupt pack table: {e}") from e
@@ -525,6 +650,41 @@ def _decode_pack(payload: bytes) -> list[bytes]:
 
 def _norm_path(rel: str) -> str:
     return rel.replace(os.sep, "/") if os.sep != "/" else rel
+
+
+def _meta(st: os.stat_result) -> tuple[int, int, int]:
+    return st.st_mtime_ns, st.st_mode, getattr(st, "st_file_attributes", 0)
+
+
+def _is_link(path: str) -> bool:
+    return os.path.islink(path) or (hasattr(os.path, "isjunction") and os.path.isjunction(path))
+
+
+def _set_win_attrs(path: str, attrs: int):
+    import ctypes
+    ctypes.windll.kernel32.SetFileAttributesW(path, (attrs & WIN_ATTR_KEEP) or WIN_ATTR_NORMAL)
+
+
+def _make_writable(path: str):
+    """Clear read-only / hidden / system so an existing file can be replaced."""
+    if os.name == "nt":
+        _set_win_attrs(path, 0)
+    else:
+        os.chmod(path, stat.S_IMODE(os.lstat(path).st_mode) | stat.S_IWUSR)
+
+
+def _apply_meta(path: str, e: "FileEntry"):
+    """Restore mtime, then permissions / attributes (read-only last, so the
+    mtime can still be set)."""
+    if e.mtime_ns >= 0:
+        os.utime(path, ns=(e.mtime_ns, e.mtime_ns))
+    if os.name == "nt":
+        if e.attrs:
+            _set_win_attrs(path, e.attrs)
+        elif e.mode and not e.mode & stat.S_IWUSR and e.kind == KIND_FILE:
+            _set_win_attrs(path, 0x1)
+    elif e.mode:
+        os.chmod(path, stat.S_IMODE(e.mode))
 
 
 def _safe_parts(path: str) -> list[str]:
@@ -548,7 +708,23 @@ class StoreWriter:
         """workers: threads for reading/chunking small files, hashing large
         ones and compressing packs (default: CPU count, max 16; 1 = no
         threads). Output is byte-identical whatever the worker count, except
-        for the manifest timestamp."""
+        for the manifest timestamp.
+
+        Holds an exclusive lock on '<path>.lock' until close()/abort(); a
+        second writer gets StoreLockedError instead of silently losing a
+        snapshot. A new store (append=False or no store yet) is written to
+        '<path>.hcs-new' and only replaces <path> when close() succeeds."""
+        self.lock = _StoreLock(path)
+        try:
+            self._init(path, chunker, codec, pack_target, near_dup_hamming, append, label,
+                       workers, max_pending_bytes)
+        except BaseException:
+            self.lock.release()
+            raise
+
+    def _init(self, path, chunker, codec, pack_target, near_dup_hamming, append, label,
+              workers, max_pending_bytes):
+        self._finished = False
         self.path = path
         self.chunker = chunker or FastCDC()
         self.codec = codec or BlockCodec()
@@ -576,7 +752,7 @@ class StoreWriter:
             self.pos = self.start = end
             self.created = False
         else:
-            self.f = open(path, "wb")
+            self.f = open(path + ".hcs-new", "wb")
             self.f.write(STORE_MAGIC)
             self.pos = self.start = len(STORE_MAGIC)
             self.created = True
@@ -659,8 +835,9 @@ class StoreWriter:
         return ptr
 
     # ---- ingest ----
-    def add_stream(self, rel_path: str, f):
-        """Add one file from a seekable binary file object."""
+    def add_stream(self, rel_path: str, f, meta: tuple | None = None):
+        """Add one file from a seekable binary file object. meta is
+        (mtime_ns, st_mode, windows_attrs) or None when unknown."""
         st = self.stats
         head = f.read(16)
         f.seek(0, os.SEEK_END)
@@ -668,10 +845,12 @@ class StoreWriter:
         f.seek(0)
         kind = media_kind(head)
         if size <= PREP_MAX:
-            self._add_prepared(rel_path, self._prepare_bytes(f.read()))
+            self._add_prepared(rel_path, self._prepare_bytes(f.read()), meta)
             return
         hr = _HashingReader(f)
         entry = FileEntry(_norm_path(rel_path), 0, b"")
+        if meta:
+            entry.mtime_ns, entry.mode, entry.attrs = meta
         if kind is not None and size <= WHOLE_MEDIA_MAX:
             st.media_files += 1
             data = hr.read()
@@ -707,18 +886,26 @@ class StoreWriter:
         return kind, len(data), sha, chunks, [hashlib.sha256(c).digest() for c in chunks], None
 
     def _prepare_path(self, full: str):
-        """Read and prepare a small file, or return None for one that should
-        be streamed (large, or grew past PREP_MAX)."""
-        if os.path.getsize(full) > PREP_MAX:
-            return None
-        with open(full, "rb") as fh:
-            data = fh.read(PREP_MAX + 1)
-        return None if len(data) > PREP_MAX else self._prepare_bytes(data)
+        """Read and prepare a small file. Returns (prep, meta); prep is None
+        for a file that should be streamed (large, or grew past PREP_MAX).
+        Returns the OSError instead of raising it, for skip-and-report."""
+        try:
+            with open(full, "rb") as fh:
+                fst = os.fstat(fh.fileno())
+                meta = _meta(fst)
+                if fst.st_size > PREP_MAX:
+                    return None, meta
+                data = fh.read(PREP_MAX + 1)
+        except OSError as e:
+            return e
+        return (None if len(data) > PREP_MAX else self._prepare_bytes(data)), meta
 
-    def _add_prepared(self, rel_path: str, prep):
+    def _add_prepared(self, rel_path: str, prep, meta: tuple | None = None):
         kind, size, sha, chunks, digests, dh = prep
         st = self.stats
         entry = FileEntry(_norm_path(rel_path), size, sha)
+        if meta:
+            entry.mtime_ns, entry.mode, entry.attrs = meta
         if kind is not None:
             st.media_files += 1
             self._note_image(kind, dh)
@@ -752,51 +939,107 @@ class StoreWriter:
         self.stats.dict_bytes = len(block)
         return True
 
-    @staticmethod
-    def _walk(root: str):
-        for dirpath, dirnames, filenames in os.walk(root):
+    def _walk(self, root: str):
+        """Yield (full_path, kind) in a stable order: every directory (so
+        empty ones and their metadata survive), symlinks / junctions as links
+        (never followed), regular files. Directories that cannot be listed
+        are reported as skipped."""
+        def onerror(e):
+            self._skip(os.path.relpath(e.filename, root) if e.filename else root, e)
+        for dirpath, dirnames, filenames in os.walk(root, onerror=onerror):
             dirnames.sort()
+            keep = []
+            for name in dirnames:
+                full = os.path.join(dirpath, name)
+                if _is_link(full):
+                    yield full, KIND_DIRLINK
+                else:
+                    yield full, KIND_DIR
+                    keep.append(name)
+            dirnames[:] = keep
             for name in sorted(filenames):
                 full = os.path.join(dirpath, name)
-                if not os.path.islink(full) and os.path.isfile(full):
-                    yield full
+                if _is_link(full):
+                    yield full, KIND_LINK
+                elif os.path.isfile(full):
+                    yield full, KIND_FILE
+
+    def _skip(self, rel: str, e: BaseException):
+        reason = getattr(e, "strerror", None) or str(e) or type(e).__name__
+        self.stats.skipped.append((_norm_path(rel), reason))
+
+    def _add_special(self, rel: str, full: str, kind: int):
+        """A directory or symlink entry (no file data read)."""
+        st = os.lstat(full)
+        e = FileEntry(_norm_path(rel), 0, EMPTY_SHA, kind=kind)
+        e.mtime_ns, e.mode, e.attrs = _meta(st)
+        if kind in (KIND_LINK, KIND_DIRLINK):
+            target = os.readlink(full).encode("utf-8", "surrogateescape")
+            e.size, e.sha256 = len(target), hashlib.sha256(target).digest()
+            if target:
+                e.pointers.append(self._put(target))
+            self.stats.links += 1
+        else:
+            self.stats.dirs += 1
+        self.entries.append(e)
 
     def add_tree(self, root: str, use_dictionary: bool | None = None, sample_budget: int = 8 << 20):
+        """Back up a directory tree. A file that cannot be read (locked by
+        another program, permission denied, vanished) is skipped and listed
+        in stats.skipped and the manifest instead of failing the whole run."""
         # A dictionary pays off when chunks are compressed alone; with large
         # solid packs it mostly costs its own size, so default to it only then.
         if use_dictionary is None:
             use_dictionary = self.pack_target <= 64 * 1024
         if not self.label:
             self.label = os.path.abspath(root)
-        files = list(self._walk(root))
+        items = list(self._walk(root))
+        files = [full for full, kind in items if kind == KIND_FILE]
         if use_dictionary and self.created and self.pos == len(STORE_MAGIC):
             seen, samples, budget = set(), [], sample_budget
             for full in files:
-                with open(full, "rb") as fh:
-                    if media_kind(fh.read(16)) is not None:
-                        continue
-                    fh.seek(0)
-                    for c in self.chunker.stream_chunks(fh, pool=self.pool):
-                        k = hashlib.sha256(c).digest()
-                        if k not in seen:
-                            seen.add(k); samples.append(c); budget -= len(c)
-                        if budget <= 0:
-                            break
+                try:
+                    with open(full, "rb") as fh:
+                        if media_kind(fh.read(16)) is not None:
+                            continue
+                        fh.seek(0)
+                        for c in self.chunker.stream_chunks(fh, pool=self.pool):
+                            k = hashlib.sha256(c).digest()
+                            if k not in seen:
+                                seen.add(k); samples.append(c); budget -= len(c)
+                            if budget <= 0:
+                                break
+                except OSError:
+                    continue            # reported when the file itself is added
                 if budget <= 0:
                     break
             self.train_dictionary(samples)
-        for full, prep in self._prepared(files):
+        prepared = self._prepared(files)
+        for full, kind in items:
             rel = os.path.relpath(full, root)
-            if prep is not None:
-                self._add_prepared(rel, prep)
-            else:
-                with open(full, "rb") as fh:
-                    self.add_stream(rel, fh)
+            try:
+                if kind != KIND_FILE:
+                    self._add_special(rel, full, kind)
+                    continue
+                pfull, res = next(prepared)
+                assert pfull == full
+                if isinstance(res, BaseException):
+                    raise res
+                prep, meta = res if res is not None else (None, None)
+                if prep is not None:
+                    self._add_prepared(rel, prep, meta)
+                else:
+                    with open(full, "rb") as fh:
+                        self.add_stream(rel, fh, meta or _meta(os.fstat(fh.fileno())))
+            except OSError as e:
+                self._skip(rel, e)
 
     def _prepared(self, files):
-        """Yield (path, prepared-or-None) in input order. With a pool, small
-        files are read, chunked and hashed ahead in worker threads (bounded
-        look-ahead, so memory stays around 4 x workers x PREP_MAX at worst)."""
+        """Yield (path, result) in input order, where result is what
+        _prepare_path returns: (prep-or-None, meta) or an OSError. With a
+        pool, small files are read, chunked and hashed ahead in worker
+        threads (bounded look-ahead, so memory stays around
+        4 x workers x PREP_MAX at worst). Without one, result is None."""
         if self.pool is None:
             for full in files:
                 yield full, None
@@ -829,6 +1072,15 @@ class StoreWriter:
         self.pending_bytes = 0
 
     def close(self) -> Stats:
+        """Finish the snapshot. On any error the run is rolled back (abort)
+        and the exception re-raised; the lock is always released."""
+        try:
+            return self._close()
+        except BaseException:
+            self.abort()
+            raise
+
+    def _close(self) -> Stats:
         try:
             self._flush()
             self._drain()
@@ -838,17 +1090,23 @@ class StoreWriter:
         label = self.label.encode("utf-8")[:65535]
         digests = b"".join(d for d, _ in self.new_index)
         ptrs = np.asarray([p for _, p in self.new_index], dtype="<u8").tobytes()
-        parts = [MANIFEST_V2,
+        parts = [MANIFEST_V3,
                  struct.pack("<QQH", self.prev_manifest, int(time.time()), len(label)), label,
                  struct.pack("<II", self.first_new_pack, len(new_packs)),
                  np.asarray(new_packs, dtype="<u8").tobytes(),
                  struct.pack("<I", len(self.new_index)), digests, ptrs,
                  struct.pack("<I", len(self.entries))]
         for e in self.entries:
-            p = e.path.encode("utf-8")
+            p = e.path.encode("utf-8", "surrogateescape")[:65535]
             parts.append(struct.pack("<H", len(p)) + p)
-            parts.append(struct.pack("<Q32sI", e.size, e.sha256, len(e.pointers)))
+            parts.append(_ENTRY3.pack(e.kind, e.size, e.sha256, e.mtime_ns, e.mode & 0xFFFFFFFF,
+                                      e.attrs & 0xFFFFFFFF, len(e.pointers)))
             parts.append(np.asarray(e.pointers, dtype="<u8").tobytes())
+        parts.append(struct.pack("<I", len(self.stats.skipped)))
+        for path, reason in self.stats.skipped:
+            p = path.encode("utf-8", "surrogateescape")[:65535]
+            r = reason.encode("utf-8", "replace")[:65535]
+            parts.append(struct.pack("<H", len(p)) + p + struct.pack("<H", len(r)) + r)
         manifest = b"".join(parts)
         block, _ = self.codec.encode(manifest, FLAG_MANIFEST)
         moff = self.pos
@@ -861,23 +1119,37 @@ class StoreWriter:
         self.pos += FOOTER.size
         self.f.flush(); os.fsync(self.f.fileno())
         self.f.close()
+        self._finished = True                  # complete on disk: abort() must not undo it now
+        if self.created:
+            try:
+                os.replace(self.path + ".hcs-new", self.path)
+            except OSError as e:
+                raise OSError(e.errno, f"could not replace {self.path} ({e.strerror}); "
+                                       f"the new store is complete at {self.path}.hcs-new") from e
+        self.lock.release()
         self.stats.manifest_bytes = len(block)
         self.stats.store_bytes = self.pos
         self.stats.added_bytes = self.pos - self.start + (len(STORE_MAGIC) if self.created else 0)
         return self.stats
 
     def abort(self):
-        """Discard everything written by this run."""
-        self._shutdown()
+        """Discard everything written by this run (a new store's temp file
+        is deleted; an existing store is truncated back to where it was)."""
         try:
-            if self.created:
+            self._shutdown()
+            if self._finished:
+                pass
+            elif self.created:
                 self.f.close()
-                os.remove(self.path)
-            else:
+                if os.path.exists(self.path + ".hcs-new"):
+                    os.remove(self.path + ".hcs-new")
+            elif not self.f.closed:
                 self.f.truncate(self.start)
                 self.f.close()
         except OSError:
             pass
+        finally:
+            self.lock.release()
 
 
 class StoreReader:
@@ -922,7 +1194,7 @@ class StoreReader:
                 raise IntegrityError(f"bad snapshot chain link at {off}")
             off = snap.prev
         chain.reverse()
-        if chain[0].version == 2 and chain[0].prev != 0:
+        if chain[0].version >= 2 and chain[0].prev != 0:
             raise IntegrityError("snapshot chain does not start at the first snapshot")
         self.snapshots: list[Snapshot] = chain
         self.pack_offsets: list[int] = []
@@ -989,7 +1261,8 @@ class StoreReader:
     @staticmethod
     def _parse_manifest(m: bytes, off: int, keep_index: bool) -> Snapshot:
         try:
-            if m[:4] == MANIFEST_V2:
+            if m[:4] in (MANIFEST_V2, MANIFEST_V3):
+                v3 = m[:4] == MANIFEST_V3
                 prev, created, ll = struct.unpack_from("<QQH", m, 4)
                 o = 4 + 18
                 label = m[o:o + ll].decode("utf-8"); o += ll
@@ -1003,8 +1276,9 @@ class StoreReader:
                     digests = m[o:o + 32 * ni]
                     ptrs = np.frombuffer(m, dtype="<u8", count=ni, offset=o + 32 * ni).tolist()
                 o += 40 * ni
-                version = 2
+                version = 3 if v3 else 2
             else:
+                v3 = False
                 (npk,) = struct.unpack_from("<I", m)
                 packs = np.frombuffer(m, dtype="<u8", count=npk, offset=4).tolist()
                 o = 4 + 8 * npk
@@ -1014,19 +1288,34 @@ class StoreReader:
             entries = []
             for _ in range(n):
                 (pl,) = struct.unpack_from("<H", m, o); o += 2
-                path = m[o:o + pl].decode("utf-8"); o += pl
-                size, sha, cnt = struct.unpack_from("<Q32sI", m, o); o += 44
+                path = m[o:o + pl].decode("utf-8", "surrogateescape" if v3 else "strict"); o += pl
+                if v3:
+                    kind, size, sha, mt, mode, attrs, cnt = _ENTRY3.unpack_from(m, o); o += _ENTRY3.size
+                    if kind > KIND_DIRLINK:
+                        raise ValueError(f"unknown entry kind {kind}")
+                else:
+                    size, sha, cnt = struct.unpack_from("<Q32sI", m, o); o += 44
+                    kind, mt, mode, attrs = KIND_FILE, -1, 0, 0
                 ptr_list = np.frombuffer(m, dtype="<u8", count=cnt, offset=o).tolist(); o += 8 * cnt
-                entries.append(FileEntry(path, size, sha, ptr_list))
+                entries.append(FileEntry(path, size, sha, ptr_list, kind, mt, mode, attrs))
+            skipped = []
+            if v3:
+                (ns,) = struct.unpack_from("<I", m, o); o += 4
+                for _ in range(ns):
+                    (pl,) = struct.unpack_from("<H", m, o); o += 2
+                    path = m[o:o + pl].decode("utf-8", "surrogateescape"); o += pl
+                    (rl,) = struct.unpack_from("<H", m, o); o += 2
+                    skipped.append((path, m[o:o + rl].decode("utf-8", "replace"))); o += rl
             if o != len(m):
                 raise ValueError("trailing bytes in manifest")
         except (struct.error, ValueError, UnicodeDecodeError) as e:
             raise IntegrityError(f"corrupt manifest at {off}: {e}") from e
-        return Snapshot(off, version, prev, created, label, first_pack, packs, entries, digests, ptrs)
+        return Snapshot(off, version, prev, created, label, first_pack, packs, entries, digests, ptrs,
+                        skipped=skipped)
 
     def _build_index(self):
         for s in self.snapshots:
-            if s.version == 2:
+            if s.version >= 2:
                 d = s.index_digests
                 for i, p in enumerate(s.index_ptrs):
                     self.index[d[32 * i:32 * i + 32]] = p
@@ -1082,11 +1371,34 @@ class StoreReader:
     def read_file(self, e: FileEntry) -> bytes:
         return b"".join(self.iter_file(e))
 
-    def unpack(self, out_dir: str, snapshot: int | None = None):
+    def unpack(self, out_dir: str, snapshot: int | None = None) -> list[str]:
+        """Restore a snapshot: files, directories (including empty ones),
+        modification times, read-only / permission bits, Windows hidden /
+        system attributes and symlinks. Symlinks are created last, so no
+        restored file is ever written through one. Returns warnings for
+        things that could not be restored (e.g. symlinks on Windows without
+        the privilege to create them)."""
         root = os.path.realpath(out_dir)
         os.makedirs(root, exist_ok=True)
+        warnings, dirs, links = [], [], []
+
+        def inside(p):
+            return p == root or p.startswith(root + os.sep)
+
         for e in self._snapshot(snapshot).entries:
-            dest = os.path.realpath(os.path.join(root, *_safe_parts(e.path)))
+            dest = os.path.join(root, *_safe_parts(e.path))
+            if not inside(os.path.realpath(os.path.dirname(dest))):
+                raise IntegrityError(f"unsafe path in manifest: {e.path}")
+            if e.kind == KIND_DIR:
+                if not inside(os.path.realpath(dest)):
+                    raise IntegrityError(f"unsafe path in manifest: {e.path}")
+                os.makedirs(dest, exist_ok=True)
+                dirs.append((dest, e))
+                continue
+            if e.kind in (KIND_LINK, KIND_DIRLINK):
+                links.append((dest, e))
+                continue
+            dest = os.path.realpath(dest)
             if not dest.startswith(root + os.sep):
                 raise IntegrityError(f"unsafe path in manifest: {e.path}")
             os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -1095,6 +1407,8 @@ class StoreReader:
                 with open(tmp, "wb") as fh:
                     for c in self.iter_file(e):
                         fh.write(c)
+                if os.path.exists(dest):
+                    _make_writable(dest)
                 os.replace(tmp, dest)
             except BaseException:
                 try:
@@ -1102,12 +1416,93 @@ class StoreReader:
                 except OSError:
                     pass
                 raise
+            _apply_meta(dest, e)
+        for dest, e in links:
+            target = self.read_file(e).decode("utf-8", "surrogateescape")
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            try:
+                if _is_link(dest):
+                    os.unlink(dest)
+                elif os.path.isdir(dest):
+                    raise OSError(0, "a directory is in the way")
+                elif os.path.lexists(dest):
+                    _make_writable(dest)
+                    os.remove(dest)
+                os.symlink(target, dest, target_is_directory=e.kind == KIND_DIRLINK)
+            except OSError as ex:
+                warnings.append(f"{e.path}: symlink -> {target} not created ({ex.strerror or ex})")
+        for dest, e in sorted(dirs, key=lambda d: d[1].path.count("/"), reverse=True):
+            try:
+                _apply_meta(dest, e)        # after the contents, so the mtime sticks
+            except OSError as ex:
+                warnings.append(f"{e.path}: metadata not restored ({ex.strerror or ex})")
+        return warnings
 
-    def verify(self, snapshot: int | None = None) -> int:
-        """Check every file of one snapshot, or of all snapshots when
-        snapshot is None. Files identical to one already checked are skipped.
-        Returns the number of file entries covered."""
+    def check_layout(self):
+        """Every byte from the header to the newest footer must belong to a
+        block, a manifest or a footer, in the order the writer produced them,
+        and every superseded footer must still point at its manifest. Reads
+        only block headers."""
+        def end_of(off):
+            hdr = self._read(off, HDR.size)
+            if len(hdr) != HDR.size or hdr[:3] != BLOCK_MAGIC:
+                raise IntegrityError(f"no block header at {off}")
+            return off + HDR.size + HDR.unpack(hdr)[3]
+        pos = len(STORE_MAGIC)
+        if self.has_dict:
+            pos = end_of(pos)
+        for s in self.snapshots:
+            for off in s.packs:
+                if off != pos:
+                    raise IntegrityError(f"store layout broken: pack at {off}, expected {pos}")
+                pos = end_of(off)
+            if s.offset != pos:
+                raise IntegrityError(f"store layout broken: manifest at {s.offset}, expected {pos}")
+            pos = s.block_end
+            moff, magic = FOOTER.unpack(self._read(pos, FOOTER.size).ljust(FOOTER.size, b"\0"))
+            if magic != STORE_MAGIC or moff != s.offset:
+                raise IntegrityError(f"damaged snapshot footer at {pos}")
+            pos += FOOTER.size
+        if pos != self.end:
+            raise IntegrityError(f"store layout broken: {self.end - pos:,} unaccounted bytes before the footer")
+
+    def verify(self, snapshot: int | None = None, strict: bool = True) -> int:
+        """Check one snapshot's files, or (snapshot=None) the whole store.
+        Returns the number of regular files covered.
+
+        Whole-store checks: the byte layout (check_layout), every pack's CRC
+        (including packs no file uses any more), that every dedup-index entry
+        really points at a chunk with that SHA-256 (a bad index would corrupt
+        future backups), and every file's SHA-256. strict=True also fails if
+        the store has bytes past its last complete snapshot (an interrupted
+        write, or a store that was cut short and fell back to an older
+        snapshot)."""
+        if strict and self.end != self.file_size:
+            raise IntegrityError(
+                f"{self.file_size - self.end:,} bytes after the last complete snapshot: the store was "
+                f"cut short or a write was interrupted, so newer snapshots may be missing. "
+                f"The next backup discards them; verify with strict=False / --allow-partial to check the rest")
         snaps = self.snapshots if snapshot is None else [self._snapshot(snapshot)]
+        if snapshot is None:
+            self.check_layout()
+            for s in self.snapshots:
+                if s.version >= 2:
+                    m, _, _ = self._block(s.offset)
+                    full = self._parse_manifest(m, s.offset, keep_index=True)
+                    want = {p: full.index_digests[32 * i:32 * i + 32] for i, p in enumerate(full.index_ptrs)}
+                else:
+                    want = {}
+                seen = 0
+                for k in range(len(s.packs)):
+                    pid = s.first_pack + k
+                    for i, c in enumerate(self._pack(pid)):
+                        d = want.get((pid << PTR_SHIFT) | i)
+                        if d is not None:
+                            seen += 1
+                            if hashlib.sha256(c).digest() != d:
+                                raise IntegrityError(f"dedup index entry for pack {pid} chunk {i} is wrong")
+                if seen != len(want):
+                    raise IntegrityError(f"dedup index of snapshot at {s.offset} points outside its packs")
         done, n = set(), 0
         for s in snaps:
             for e in s.entries:
@@ -1116,7 +1511,7 @@ class StoreReader:
                     for _ in self.iter_file(e):
                         pass
                     done.add(key)
-                n += 1
+                n += e.kind == KIND_FILE
         return n
 
     def unused_ranges(self) -> list[tuple[int, int]]:
@@ -1163,7 +1558,19 @@ def _write(store: str, src: str, append: bool, level: int = 19, workers: int | N
     dt = time.time() - t0
     print(_fmt(st))
     print(f"time={dt:.1f}s ({st.input_bytes / 1e6 / dt if dt else 0:.1f} MB/s)")
+    if st.skipped:
+        _print_skipped(st.skipped)
+        return 3
     return 0
+
+
+def _print_skipped(skipped, limit=50):
+    print(f"warning: {len(skipped)} item(s) could not be read and are NOT in this snapshot:",
+          file=sys.stderr)
+    for path, reason in skipped[:limit]:
+        print(f"  {path}: {reason}", file=sys.stderr)
+    if len(skipped) > limit:
+        print(f"  ... and {len(skipped) - limit} more (run `list --skipped`)", file=sys.stderr)
 
 
 def main(argv) -> int:
@@ -1180,11 +1587,14 @@ def main(argv) -> int:
                        help="threads (default: CPU count, max 16; 1 = single-threaded)")
     p = sub.add_parser("list", help="list snapshots")
     p.add_argument("store")
+    p.add_argument("--skipped", action="store_true", help="also list items each snapshot could not read")
     p = sub.add_parser("unpack", help="restore a snapshot (default: newest)")
     p.add_argument("store"); p.add_argument("output_dir")
     p.add_argument("--snapshot", type=int, default=None, help="1-based snapshot number")
-    p = sub.add_parser("verify", help="check every file of every snapshot")
+    p = sub.add_parser("verify", help="check the whole store: layout, every block, index and file")
     p.add_argument("store")
+    p.add_argument("--allow-partial", action="store_true",
+                   help="do not fail on bytes left by an interrupted write / a cut-short store")
     a = ap.parse_args(argv)
 
     try:
@@ -1194,18 +1604,28 @@ def main(argv) -> int:
             return _write(a.store, a.input_dir, append=True, level=a.level, workers=a.workers)
         with StoreReader(a.store) as r:
             if a.cmd == "list":
-                print(f"{'#':>3}  {'created':19}  {'files':>7}  {'bytes':>15}  source")
+                print(f"{'#':>3}  {'created':19}  {'files':>7}  {'bytes':>15}  {'skipped':>7}  source")
                 for i, s in enumerate(r.snapshots, 1):
                     when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(s.created)) if s.created else "(v1 store)"
-                    print(f"{i:>3}  {when:19}  {len(s.entries):>7}  {s.input_bytes:>15,}  {s.label}")
+                    print(f"{i:>3}  {when:19}  {len(s.files):>7}  {s.input_bytes:>15,}  {len(s.skipped):>7}  {s.label}")
+                    if a.skipped:
+                        for path, reason in s.skipped:
+                            print(f"       skipped {path}: {reason}")
                 print(f"store size {r.end:,} bytes")
             elif a.cmd == "unpack":
-                r.unpack(a.output_dir, a.snapshot)
-                print("ok")
+                warnings = r.unpack(a.output_dir, a.snapshot)
+                for w in warnings:
+                    print(f"warning: {w}", file=sys.stderr)
+                print("ok" if not warnings else f"ok, with {len(warnings)} warning(s)")
+                return 3 if warnings else 0
             else:
-                n = r.verify()
-                print(f"verified {n} files across {len(r.snapshots)} snapshot(s), all bit-exact")
+                n = r.verify(strict=not a.allow_partial)
+                print(f"verified {n} files across {len(r.snapshots)} snapshot(s): layout, blocks, "
+                      f"index and files all intact")
         return 0
+    except StoreLockedError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 4
     except (IntegrityError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

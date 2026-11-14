@@ -167,10 +167,15 @@ def _():
     good = os.path.getsize(store)
     tree(src, {"x9.txt": os.urandom(3_000_000)})
     w = hs.StoreWriter(store, append=True); w.add_tree(src); w._flush(); w._drain(); w._shutdown()
-    w.f.close()                                # "crash": packs written, no manifest/footer
+    w.f.close(); w.lock.release()              # "crash": packs written, no manifest/footer; OS drops the lock
     assert os.path.getsize(store) > good
     with hs.StoreReader(store) as r:
-        assert r.end == good and len(r.snapshots) == 1 and r.verify() == 4
+        assert r.end == good and len(r.snapshots) == 1 and r.verify(strict=False) == 4
+        try:
+            r.verify()
+            raise AssertionError("strict verify accepted a store with an interrupted write")
+        except hs.IntegrityError:
+            pass
     w = hs.StoreWriter(store, append=True)
     assert w.recovered_bytes > 0
     w.add_tree(src); w.close()
@@ -238,6 +243,156 @@ def _():
             caught += 1
         os.remove(p)
     assert caught + harmless == 150
+
+
+@check("store lock: a second writer (same process or another) is refused, and the lock is freed after")
+def _():
+    store = os.path.join(TMP, "lock.hcs")
+    w = hs.StoreWriter(store, append=True); w.add_file("a.txt", b"one")
+    try:
+        hs.StoreWriter(store, append=True)
+        raise AssertionError("second writer in the same process was allowed")
+    except hs.StoreLockedError:
+        pass
+    other = subprocess.run([sys.executable, "-c",
+        "import sys; sys.path.insert(0, sys.argv[1]); import hybridstore as hs\n"
+        "try:\n hs.StoreWriter(sys.argv[2], append=True)\nexcept hs.StoreLockedError as e:\n print('LOCKED', e)",
+        HERE, store], capture_output=True, text=True)
+    assert "LOCKED" in other.stdout and "pid" in other.stdout, other
+    w.close()
+    assert not os.path.exists(store + ".lock")
+    w = hs.StoreWriter(store, append=True); w.add_file("b.txt", b"two"); w.close()
+    with hs.StoreReader(store) as r:
+        assert len(r.snapshots) == 2 and r.verify() == 2
+
+
+def hold_exclusively(path):
+    """Open a file so no other handle can read it (Windows), or remove read
+    permission (POSIX). Returns a function that undoes it."""
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        h = k32.CreateFileW(path, 0x80000000, 0, None, 3, 0x80, None)   # GENERIC_READ, no sharing
+        assert h not in (None, wintypes.HANDLE(-1).value), ctypes.get_last_error()
+        return lambda: k32.CloseHandle(wintypes.HANDLE(h))
+    os.chmod(path, 0)
+    return lambda: os.chmod(path, 0o644)
+
+
+@check("unreadable / locked files are skipped and reported; the rest of the backup completes")
+def _():
+    src = os.path.join(TMP, "locked")
+    tree(src, {"ok1.txt": text(50_000, 1), "sub/big.log": text(9_000_000, 2), "busy.db": b"x" * 1000,
+               "sub/busy_big.db": text(9_500_000, 3), "ok2.txt": text(50_000, 4)})
+    undo = [hold_exclusively(os.path.join(src, "busy.db")),
+            hold_exclusively(os.path.join(src, "sub", "busy_big.db"))]
+    try:
+        for workers in (1, 4):
+            store = os.path.join(TMP, f"locked{workers}.hcs")
+            w = hs.StoreWriter(store, workers=workers); w.add_tree(src); st = w.close()
+            assert sorted(p for p, _ in st.skipped) == ["busy.db", "sub/busy_big.db"], st.skipped
+            assert st.files == 3
+            with hs.StoreReader(store) as r:
+                assert r.verify() == 3 and [p for p, _ in r.snapshots[-1].skipped] == [p for p, _ in st.skipped]
+        rc = hs.main(["backup", src, os.path.join(TMP, "locked_cli.hcs"), "--workers", "2"])
+        assert rc == 3, rc
+    finally:
+        for u in undo:
+            u()
+
+
+@check("verify fails on a store that was cut short, even where reading falls back to an older snapshot")
+def _():
+    store = os.path.join(TMP, "inc.hcs")
+    data = open(store, "rb").read()
+    with hs.StoreReader(store) as r:
+        first_end = r.snapshots[0].block_end + hs.FOOTER.size
+    r9 = random.Random(9)
+    for cut in [first_end + 1, len(data) - 1] + [r9.randrange(first_end + 1, len(data)) for _ in range(20)]:
+        p = store + ".cut"
+        open(p, "wb").write(data[:cut])
+        with hs.StoreReader(p) as rr:
+            assert len(rr.snapshots) == 1
+            try:
+                rr.verify()
+                raise AssertionError(f"truncated store (cut at {cut}) passed verify")
+            except hs.IntegrityError:
+                pass
+            assert rr.verify(strict=False) == 20
+    assert hs.main(["verify", p]) == 1 and hs.main(["verify", p, "--allow-partial"]) == 0
+    os.remove(p)
+
+
+@check("decompression is bounded: bombs and oversized claims are rejected without big allocations")
+def _():
+    import tracemalloc, zlib
+    c = hs.BlockCodec()
+    bomb = zlib.compress(bytes(1 << 28), 9)          # 256 MiB of zeros in ~260 KB
+    cases = [hs.HDR.pack(hs.BLOCK_MAGIC, hs.CODEC_ZLIB, 100, len(bomb), 0) + bomb,
+             hs.HDR.pack(hs.BLOCK_MAGIC, hs.CODEC_ZLIB, 3_000_000_000, len(bomb), 0) + bomb,
+             hs.HDR.pack(hs.BLOCK_MAGIC, hs.CODEC_ZSTD, 3_000_000_000, 9, 0) + bytes(9)]
+    for blk in cases:
+        tracemalloc.start()
+        try:
+            c.decode_block(blk[:16], blk[16:], 0)
+            raise AssertionError("hostile block decoded")
+        except hs.IntegrityError:
+            pass
+        peak = tracemalloc.get_traced_memory()[1]; tracemalloc.stop()
+        assert peak < 20 << 20, peak
+
+
+@check("metadata: empty dirs, mtimes, read-only, hidden (Windows) and symlinks round-trip")
+def _():
+    import stat as st_
+    src = os.path.join(TMP, "meta")
+    tree(src, {"a.txt": b"hello", "d/b.txt": b"world", "hid.txt": b"secret"})
+    os.makedirs(os.path.join(src, "empty", "deeper"))
+    for p, t in (("a.txt", 1_000_000_000), ("d/b.txt", 1_100_000_000), ("d", 1_200_000_000),
+                 ("empty/deeper", 1_300_000_000)):
+        os.utime(os.path.join(src, *p.split("/")), ns=(t * 10**9 + 123_456_700, t * 10**9 + 123_456_700))
+    ro = os.path.join(src, "a.txt"); os.chmod(ro, st_.S_IREAD)
+    if os.name == "nt":
+        import ctypes
+        ctypes.windll.kernel32.SetFileAttributesW(os.path.join(src, "hid.txt"), 0x2)
+    try:
+        os.symlink(os.path.join("d", "b.txt"), os.path.join(src, "link.txt")); links = True
+    except OSError:
+        links = False                                # Windows without Developer Mode / admin
+    store = os.path.join(TMP, "meta.hcs")
+    w = hs.StoreWriter(store); w.add_tree(src); stats = w.close()
+    assert stats.dirs == 3 and stats.links == links and stats.files == 3, stats
+    out = os.path.join(TMP, "meta_out")
+    for _ in range(2):                               # second restore overwrites read-only / hidden files
+        with hs.StoreReader(store) as r:
+            assert r.verify() == 3
+            warnings = r.unpack(out)
+    assert warnings == [], warnings
+    same_tree(src, out)
+    assert os.path.isdir(os.path.join(out, "empty", "deeper"))
+    for p in ("a.txt", "d/b.txt", "d", "empty/deeper"):
+        a, b = (os.stat(os.path.join(x, *p.split("/"))).st_mtime_ns for x in (src, out))
+        assert a == b, (p, a, b)
+    assert not os.access(os.path.join(out, "a.txt"), os.W_OK)
+    if os.name == "nt":
+        assert os.stat(os.path.join(out, "hid.txt")).st_file_attributes & 0x2
+    if links:
+        assert os.path.islink(os.path.join(out, "link.txt")) and os.readlink(os.path.join(out, "link.txt")) == os.path.join("d", "b.txt")
+    for base in (src, out):
+        os.chmod(os.path.join(base, "a.txt"), st_.S_IREAD | st_.S_IWRITE)
+
+
+@check("a failed `pack` over an existing store leaves the old store untouched")
+def _():
+    store = os.path.join(TMP, "lock.hcs")
+    before = open(store, "rb").read()
+    w = hs.StoreWriter(store)                        # overwrite mode
+    w.add_file("x.bin", os.urandom(100_000)); w.abort()
+    assert open(store, "rb").read() == before and not os.path.exists(store + ".hcs-new")
 
 
 if __name__ == "__main__":

@@ -17,7 +17,8 @@ It lists five Phase I bugs and Phase II fixes: a naive XOR boundary test (fix: a
 | `hybridstore.py` | The engine and CLI (commands below) |
 | `bench.py` | Builds the sample datasets, checks round trips, runs an incremental-backup run and the corruption test, compares against baselines |
 | `bench_large.py` | Packs, verifies and restores one large file (default 2 GiB) and reports peak memory |
-| `test_hybridstore.py` | Checks for streaming, snapshots, v1 compatibility, crash recovery, path safety and large media |
+| `test_hybridstore.py` | 17 checks: streaming, snapshots, v1 compatibility, crash recovery, path safety, large media, locking, skipped files, strict verify, decompression bombs, metadata |
+| `FORMAT.md` | Byte-level specification of the store format |
 | `hybridstore.cmd` | Windows launcher that uses the local `.venv` |
 | `bench_results.txt` | Output of the original benchmark run (Linux container, v1 engine) |
 | `bench_results_3090.txt` | Output of the latest benchmark run on a Windows 11 / RTX 3090 PC |
@@ -29,10 +30,51 @@ Requirements: Python 3.10+, numpy, `zstandard` (optional; without it only zlib i
 ```
 python hybridstore.py pack   <input_dir> <store> [--level N] [--workers N]  # new store (overwrites)
 python hybridstore.py backup <input_dir> <store> [--level N] [--workers N]  # add a snapshot; creates the store if missing
-python hybridstore.py list   <store>                             # show snapshots
+python hybridstore.py list   <store> [--skipped]                 # show snapshots (and what each could not read)
 python hybridstore.py unpack <store> <output_dir> [--snapshot N] # default: newest snapshot
-python hybridstore.py verify <store>                             # check every file of every snapshot
+python hybridstore.py verify <store> [--allow-partial]           # check layout, every block, the index and every file
 ```
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| 0 | OK |
+| 1 | Integrity error, or `verify` found a cut-short store |
+| 3 | Finished with warnings: `backup`/`pack` skipped unreadable items, or `unpack` could not create some symlinks |
+| 4 | Another backup is writing to the store |
+
+The byte-level format is specified in [FORMAT.md](FORMAT.md).
+
+### Hardening (Phase 1)
+
+These fixes address the problems found in the 2026-11-14 probes and fuzzing:
+
+* **Store lock.** A writer holds an exclusive OS lock on `<store>.lock`, and a second `backup` exits with code 4 and names the holder (pid, host, start time).
+  * Before this, two concurrent backups silently lost a snapshot.
+  * A crash cannot leave a stale lock, because the OS releases it.
+* **Skip and report.** A file that cannot be read (opened exclusively by another program, permission denied, deleted mid-run) is skipped. It is listed on stderr and in the snapshot's manifest (`list --skipped`), and the exit code is 3.
+  * Before this, one locked file aborted the whole backup.
+  * Windows VSS snapshots, for reading files that are in use, are still to do.
+* **Strict verify.** `verify` now checks:
+  * the byte layout of the whole store (no gaps, every old footer intact);
+  * every pack's CRC, including packs no file references;
+  * that every dedup-index entry hashes to its digest (a bad index would silently corrupt later backups);
+  * every file.
+
+  It also fails if the store has bytes after its last complete snapshot. Before this, a store that was cut short fell back to an older snapshot and still passed. `--allow-partial` checks the rest.
+  * Fuzzing with 1,500 random corruptions: before, 1,460 were rejected, 29 truncations were accepted and 11 corruptions of unused bytes were accepted. Now all 1,500 are rejected.
+* **Bounded decompression.** A block can claim at most `max(256 MiB, 256 × its stored size)`, and zlib output is capped at the header's length.
+  * A 1 MB zlib bomb that used to allocate 2.2 GB is now rejected after about 1 MB.
+* **Metadata (manifest v3).** Backups now record and `unpack` restores:
+  * directories, including empty ones;
+  * modification times to the nanosecond;
+  * POSIX permission bits;
+  * Windows read-only, hidden, system and archive attributes;
+  * symlinks and junctions, stored as links and never followed.
+
+  Symlinks are restored last, so nothing is written through them. On Windows, creating them needs Developer Mode or admin; otherwise `unpack` warns (exit 3).
+* **Safe `pack`.** A new store is written to `<store>.hcs-new` and only replaces the old one once it is complete, so a failed `pack` no longer destroys the previous store.
 
 ### Incremental backups, streaming and portability (v2 store format)
 
@@ -111,4 +153,14 @@ When each ~8 KiB chunk was compressed on its own, the result lost badly to plain
 
 ## 5. Suggested next steps
 
-Use zstd's own long-distance matching inside packs, delta-compress similar chunks (find them by sketch or resemblance), add refcounts/GC so old snapshots can be deleted (the index is now persisted, see v2 notes), move dedup lookups and manifest building off the single writer thread for folders with many small files, and add a lossless JPEG recompressor (for example, a Brunsli/JPEG XL-style transcode) instead of a lossy neural codec.
+Phase 2 of the hardening plan:
+
+* Skip unchanged files by size and mtime.
+* Delete snapshots, with refcounts and garbage collection.
+* Encryption (AES-GCM or ChaCha20-Poly1305 with Argon2id).
+* An on-disk dedup index, so the index no longer takes about 17 GB of RAM per TB of unique data.
+* Read manifests lazily.
+* Reed-Solomon parity.
+* Windows VSS.
+
+Beyond that: use zstd's own long-distance matching inside packs, delta-compress similar chunks (find them by sketch or resemblance), add refcounts/GC so old snapshots can be deleted (the index is now persisted, see v2 notes), move dedup lookups and manifest building off the single writer thread for folders with many small files, and add a lossless JPEG recompressor (for example, a Brunsli/JPEG XL-style transcode) instead of a lossy neural codec.
