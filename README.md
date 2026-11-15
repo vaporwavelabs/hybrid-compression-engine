@@ -20,6 +20,9 @@ It lists five Phase I bugs and Phase II fixes: a naive XOR boundary test (fix: a
 | `test_hybridstore.py` | 20 checks: streaming, snapshots, v1 compatibility, crash recovery, path safety, large media, locking, skipped files, strict verify, decompression bombs, metadata, unchanged-file reuse, prune (copy/repack/dictionary, policies, dry run, refusals) |
 | `FORMAT.md` | Byte-level specification of the store format |
 | `hybridstore.cmd` | Windows launcher that uses the local `.venv` |
+| `hybridstore_mcp.py` | Read-only MCP server: lets an LLM list, read, search and diff snapshots without unpacking (see below) |
+| `test_hybridstore_mcp.py` | 10 checks for the MCP server: each tool, paging, encodings, path safety, the stdio protocol, prune while the server runs |
+| `hybridstore-mcp.cmd` | Windows launcher for the MCP server |
 | `bench_results.txt` | Output of the original benchmark run (Linux container, v1 engine) |
 | `bench_results_3090.txt` | Output of the latest benchmark run on a Windows 11 / RTX 3090 PC |
 
@@ -174,6 +177,39 @@ When each ~8 KiB chunk was compressed on its own, the result lost badly to plain
 * **Limitation:** content changed while both size and time stay exactly the same is only picked up by `backup --rehash`. Some copy tools preserve times, so run `--rehash` now and then, for example monthly.
 
 * **Windows detail:** NTFS updates the size and time it reports in directory listings lazily, so a file still being written can show stale values there. The listing is therefore only a first filter. Every file it says is unchanged is confirmed with an exact `lstat` before it is reused. This costs about 0.1 s per 2,500 unchanged files. Folders and links always get an exact `lstat`, because their metadata is stored.
+
+### Letting an LLM read a store: `hybridstore_mcp.py`
+
+A model cannot interpret compressed bytes, so it gets tools instead. `hybridstore_mcp.py` is a small [MCP](https://modelcontextprotocol.io) server (stdio transport, no extra dependencies). Each tool call opens the store, decompresses only the packs it needs, and returns plain text.
+
+```
+python hybridstore_mcp.py <store.hcs> [name=<other.hcs> ...]      # serve over stdio
+python hybridstore_mcp.py <store.hcs> --call search "{\"pattern\": \"TODO\"}"   # one call from a shell
+python hybridstore_mcp.py --tools                                  # tool schemas as JSON
+```
+
+| Tool | What it returns |
+|---|---|
+| `list_snapshots` | Snapshot numbers, times, file counts, sizes and source folders |
+| `list_files` | One directory (sub-directories with file counts, then files), or a flat list with `recursive` / `glob`; paged |
+| `read_file` | A text file with line numbers, paged by `start_line` / `max_lines`; UTF-8 and UTF-16; binary files get a one-line description |
+| `search` | grep over a snapshot's text files: literal or regex, `dir` / `glob` filters, context lines; identical files are searched once |
+| `diff_snapshots` | Files added, deleted and modified between two snapshots, or a unified diff of one file |
+| `file_history` | In which snapshots a file was added, changed or deleted |
+
+* **Read-only and confined.** No tool writes. The model cannot pass a store path: it can only use the stores named on the command line, and file paths are looked up in the snapshot's manifest, never on disk.
+* **Bounded output.** A call returns at most 100,000 characters, and `search` has a result limit and a time budget, so one call cannot flood the model's context.
+* **Does not block backups.** The store is opened per call and closed again, so `backup` and `prune` work while the server is running, and the next call sees the new state.
+* **File contents are data.** Text from a backup may contain instructions aimed at a model. The tool descriptions say so, but the client should still treat it as untrusted.
+* **Measured** on the project's `site-packages` (2,544 files, 79.6 MB, 22.8 MB store), including Python start-up: listing 0.4 s; reading 3 lines at line 900 of a file 0.4 s; searching all 1,451 text files 0.8 s.
+
+To add it to Claude Code:
+
+```
+claude mcp add hybridstore -- G:\path	o\hybridstore-mcp.cmd G:\path	oackups.hcs
+```
+
+Not done yet: semantic search (an embedding per chunk, keyed by chunk hash, so deduplicated data is embedded once).
 
 ### Deleting snapshots: `prune` (Phase 2, step 2)
 
