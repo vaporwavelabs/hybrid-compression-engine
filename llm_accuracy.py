@@ -55,6 +55,7 @@ def main(argv) -> int:
     ap.add_argument("store")
     ap.add_argument("--source", help="original folder (default: the snapshot's recorded source)")
     ap.add_argument("--snapshot", type=int, default=None)
+    ap.add_argument("--no-rerank", action="store_true", help="semantic: similarity order only")
     ap.add_argument("--samples", type=int, default=100, help="search patterns / semantic queries")
     ap.add_argument("--max-file-mb", type=float, default=4)
     ap.add_argument("--seed", type=int, default=7)
@@ -212,7 +213,7 @@ def main(argv) -> int:
                     ls = orig_lines(disk, enc)
                     mid = rng.randint(s0, max(s0, e0 - 2))
                     query = "\n".join(ls[mid - 1:mid + 2])
-                    hits, _ = ix.search(r, snap, query, k=5)
+                    hits, _ = ix.search(r, snap, query, k=5, rerank=not a.no_rerank)
                     rank = next((i for i, h in enumerate(hits, 1)
                                  if h["start"] <= mid <= h["end"] and
                                  by_path.get(h["path"], (None,))[0] is not None and

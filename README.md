@@ -227,6 +227,7 @@ python hybridstore_semantic.py gc     <store.hcs>    # after prune: drop entries
 * **Passages.** Text files are cut into passages of about 600-3,000 characters, at line ends chosen by the line's content (a hash), not by position. An edit early in a file therefore changes only the passages around it.
 * **Dedup carries over.** Each passage is keyed by the SHA-256 of its text and embedded once. The same passage in another file or another snapshot reuses the vector. Files are keyed by their content hash from the manifest, so a file unchanged since the last run is not even read. Indexing a new snapshot only embeds what changed.
 * **Not chunk-keyed.** Store chunks (about 8 KB, cut anywhere, even mid-line) are too large and too arbitrary for good search results, so the index uses its own line-aligned passages. They keep the same dedup property and give line numbers that match `read_file`.
+* **Re-ranking.** The 200 passages closest in meaning are read back from the store and re-ordered by similarity plus how many of the question's words and word pairs they hold (rare words count more). This separates passages that look alike. `search --no-rerank` gives the similarity order alone.
 * **Coverage is reported.** Results say how many files in scope are indexed. Files added by a later backup are not searched until `index` runs again.
 * **Embedding server:** `$HYBRIDSTORE_EMBED_URL`, else `$OLLAMA_HOST`, else `127.0.0.1:11434`. An index is tied to the model that built it, and a different model is refused.
 * **Privacy.** The sidecar holds vectors and line numbers, not text. Snippets are read back from the store at search time. Vectors can still leak some information about the text, so protect the sidecar like the store.
@@ -241,10 +242,10 @@ python hybridstore_semantic.py gc     <store.hcs>    # after prune: drop entries
 | Bytes read from the store vs. disk | 2,544 / 2,544 files identical (100%) |
 | `read_file`, every line of every text file | 564,164 / 564,164 lines identical (100%) |
 | `search` vs. grep on the originals (103 patterns) | 2,550 / 2,550 matching lines, 0 wrong (precision and recall 100%) |
-| `semantic_search` snippets | 2,192 / 2,192 lines identical (100%) |
-| `semantic_search` finds the passage a 3-line excerpt came from | ranked 1st 39%, top 5 63% (a passage containing the text: 44% / 67%) |
+| `semantic_search` snippets | 2,356 / 2,356 lines identical (100%) |
+| `semantic_search` finds the passage a 3-line excerpt came from | ranked 1st 81%, top 5 92% (a passage containing the text: 89% / 93%) |
 
-The exact tools reproduce the data exactly. Semantic search is a ranking, not an exact lookup: it is for questions by meaning, and `search` is the tool for exact text. Its ranking is still weak on near-identical code (for example numpy's `hermite.py` vs `laguerre.py`) and data files; with the index 30% built it scored 57% / 78%, so more indexed text means more close competitors.
+The exact tools reproduce the data exactly. Semantic search is a ranking, not an exact lookup: it is for questions by meaning, and `search` is the tool for exact text. By similarity alone it scored 39% / 63% (`--no-rerank`), because near-identical code (numpy's `hermite.py` vs `laguerre.py`) and data files crowd out the right passage; the word-match re-ranking fixes most of that. The test queries are verbatim excerpts, which favours word matching: expect less gain for questions phrased in other words.
 
 ### Deleting snapshots: `prune` (Phase 2, step 2)
 

@@ -28,13 +28,14 @@ An index is tied to the model that built it.
 """
 from __future__ import annotations
 
-import argparse, fnmatch, hashlib, json, os, sqlite3, sys, time, urllib.error, urllib.request, zlib
+import argparse, fnmatch, hashlib, json, math, os, re, sqlite3, sys, time, urllib.error, urllib.request, zlib
 
 import numpy as np
 
 import hybridstore as hs
 
 SCHEMA = 1
+POOL, LEX_WEIGHT = 200, 0.5     # re-rank the best POOL passages: similarity + LEX_WEIGHT * word match
 MIN_CHARS, TARGET_MASK, MAX_CHARS = 600, 7, 3000   # passage size: >= MIN, cut on hash & MASK == 0, <= MAX
 MAX_FILE = 4 << 20                                 # default: skip text files larger than this
 BATCH = 32
@@ -83,6 +84,9 @@ def embed(texts: list[str], model: str, url: str | None = None, timeout: int = 6
         raise SemanticError("the embedding server returned an unexpected answer")
     n = np.linalg.norm(v, axis=1, keepdims=True)
     return v / np.where(n == 0, 1, n)
+
+
+_WORD = re.compile(r"\w+")
 
 
 def text_lines(r: hs.StoreReader, e: hs.FileEntry):
@@ -273,7 +277,11 @@ class Index:
 
     # ---- searching ----
     def search(self, r: hs.StoreReader, snap: hs.Snapshot, query: str, k: int = 10, d: str = "",
-               glob: str | None = None, url: str | None = None) -> tuple[list[dict], dict]:
+               glob: str | None = None, url: str | None = None, rerank: bool = True
+               ) -> tuple[list[dict], dict]:
+        """Best k passages. With rerank, the POOL most similar passages are read back from
+        the store and re-ordered by similarity + LEX_WEIGHT * word match with the query, which
+        separates near-identical passages (sibling modules, tables of numbers)."""
         files = select_files(snap, d, glob)
         by_sha: dict[bytes, list[hs.FileEntry]] = {}
         for e in files:
@@ -297,18 +305,59 @@ class Index:
             raise SemanticError(f"query vector has {q.shape[0]} dims, the index {mat.shape[1]}; "
                                 f"is the embedding server running a different model?")
         score = mat.astype(np.float32) @ q
+        order = np.argsort(-score)
+        lex: dict[int, float] = {}
+        if rerank:
+            pool = [int(i) for i in order[:max(POOL, 5 * k)]]
+            lex = self._word_match(r, query, [(i, prow[i][0], prow[i][1], prow[i][2]) for i in pool], by_sha)
+            pool.sort(key=lambda i: -(float(score[i]) + LEX_WEIGHT * lex[i]))
+            order = pool
         hits, used = [], set()
-        for i in np.argsort(-score):
+        for i in order:
             fsha, a, b, _ = prow[i]
             for e in by_sha[fsha]:                  # one content can live at several paths
                 key = (e.path, a)
                 if key in used:
                     continue
                 used.add(key)
-                hits.append({"path": e.path, "start": a, "end": b, "score": float(score[i]), "entry": e})
+                hits.append({"path": e.path, "start": a, "end": b, "score": float(score[i]),
+                             "words": lex.get(i), "entry": e})
             if len(hits) >= k:
                 break
         return hits[:k], cover
+
+    @staticmethod
+    def _word_match(r, query: str, cand: list[tuple], by_sha: dict) -> dict[int, float]:
+        """{candidate id: 0..1}: how much of the query's words and word pairs each candidate
+        passage holds; words that are rare among the candidates count for more."""
+        want: dict[bytes, list[tuple]] = {}
+        for cid, fsha, a, b in cand:
+            want.setdefault(fsha, []).append((cid, a, b))
+        text: dict[int, list[str]] = {cid: [] for cid, *_ in cand}
+        for fsha, spans in want.items():
+            enc, lines = text_lines(r, by_sha[fsha][0])
+            if enc is None:
+                continue
+            last = max(b for _, _, b in spans)
+            for no, line in enumerate(lines, 1):
+                if no > last:
+                    lines.close()
+                    break
+                for cid, a, b in spans:
+                    if a <= no <= b:
+                        text[cid].append(line)
+
+        def terms(t: str) -> set:
+            w = _WORD.findall(t.lower())
+            return set(w) | set(zip(w, w[1:]))
+        qt = terms(query)
+        if not qt:
+            return {cid: 0.0 for cid in text}
+        have = {cid: terms(chr(10).join(ls)) & qt for cid, ls in text.items()}
+        n = len(have)
+        idf = {t: math.log(1 + n / (1 + sum(1 for h in have.values() if t in h))) for t in qt}
+        total = sum(idf.values())
+        return {cid: sum(idf[t] for t in h) / total for cid, h in have.items()}
 
     def gc(self, r: hs.StoreReader) -> dict:
         live = {e.sha256 for s in r.snapshots for e in s.files}
@@ -354,7 +403,8 @@ def format_hits(r, n, snap, query, hits, cover, model) -> str:
            f"(model {model}; {cover['indexed']} of {cover['files']} files in scope are indexed"
            + (f", {cover['not_indexed']} not indexed yet" if cover["not_indexed"] else "") + ")"]
     for i, h in enumerate(hits, 1):
-        out.append(f"\n[{i}] {h['path']}  lines {h['start']}-{h['end']}  similarity {h['score']:.3f}")
+        out.append(f"\n[{i}] {h['path']}  lines {h['start']}-{h['end']}  similarity {h['score']:.3f}"
+                   + (f"  word match {h['words']:.0%}" if h.get("words") is not None else ""))
         out.append(snippet(r, h["entry"], h["start"], h["end"]))
     if not hits:
         out.append("no indexed text in scope" if cover["indexed"] == 0 else "no results")
@@ -380,6 +430,7 @@ def main(argv) -> int:
     p.add_argument("-k", type=int, default=10)
     p.add_argument("--snapshot", type=int, default=None)
     p.add_argument("--dir", default=""); p.add_argument("--glob", default=None)
+    p.add_argument("--no-rerank", action="store_true", help="order by similarity alone (no word match)")
     p = sub.add_parser("status", help="show what the index holds and covers")
     p.add_argument("store")
     p = sub.add_parser("gc", help="drop index entries for files no snapshot contains any more")
@@ -404,7 +455,8 @@ def main(argv) -> int:
                 if not 1 <= n <= len(r.snapshots):
                     raise SemanticError(f"snapshot {n} does not exist (1..{len(r.snapshots)})")
                 with Index(a.store) as ix:
-                    hits, cover = ix.search(r, r.snapshots[n - 1], a.query, a.k, a.dir, a.glob)
+                    hits, cover = ix.search(r, r.snapshots[n - 1], a.query, a.k, a.dir, a.glob,
+                                            rerank=not a.no_rerank)
                     sys.stdout.buffer.write(format_hits(r, n, r.snapshots[n - 1], a.query, hits, cover,
                                                         ix.model).encode("utf-8", "replace") + b"\n")
             elif a.cmd == "status":
