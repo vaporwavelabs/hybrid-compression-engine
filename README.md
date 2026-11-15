@@ -234,17 +234,17 @@ python hybridstore_semantic.py gc     <store.hcs>    # after prune: drop entries
 
 #### Accuracy: what the tools return vs. the original files
 
-`python llm_accuracy.py <store.hcs>` compares the tools' output from the compressed store with the original folder on disk. Measured on the project's `site-packages` (2,544 files, 83.4 MB; 100 samples; semantic index about 30% built at the time):
+`python llm_accuracy.py <store.hcs>` compares the tools' output from the compressed store with the original folder on disk. Measured on the project's `site-packages` (2,544 files, 83.4 MB; 100 samples; full semantic index: 26,320 passages from 1,451 text files, built in 26 min, 112.8 MB):
 
 | Check | Result |
 |---|---|
 | Bytes read from the store vs. disk | 2,544 / 2,544 files identical (100%) |
 | `read_file`, every line of every text file | 564,164 / 564,164 lines identical (100%) |
 | `search` vs. grep on the originals (103 patterns) | 2,550 / 2,550 matching lines, 0 wrong (precision and recall 100%) |
-| `semantic_search` snippets | 2,334 / 2,334 lines identical (100%) |
-| `semantic_search` finds the passage a 3-line excerpt came from | ranked 1st 57%, top 5 78% (a passage containing the text: 60% / 81%) |
+| `semantic_search` snippets | 2,192 / 2,192 lines identical (100%) |
+| `semantic_search` finds the passage a 3-line excerpt came from | ranked 1st 39%, top 5 63% (a passage containing the text: 44% / 67%) |
 
-The exact tools reproduce the data exactly. Semantic search is a ranking, not an exact lookup: it is for questions by meaning, and `search` is the tool for exact text.
+The exact tools reproduce the data exactly. Semantic search is a ranking, not an exact lookup: it is for questions by meaning, and `search` is the tool for exact text. Its ranking is still weak on near-identical code (for example numpy's `hermite.py` vs `laguerre.py`) and data files; with the index 30% built it scored 57% / 78%, so more indexed text means more close competitors.
 
 ### Deleting snapshots: `prune` (Phase 2, step 2)
 
