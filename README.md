@@ -23,6 +23,9 @@ It lists five Phase I bugs and Phase II fixes: a naive XOR boundary test (fix: a
 | `hybridstore_mcp.py` | Read-only MCP server: lets an LLM list, read, search and diff snapshots without unpacking (see below) |
 | `test_hybridstore_mcp.py` | 10 checks for the MCP server: each tool, paging, encodings, path safety, the stdio protocol, prune while the server runs |
 | `hybridstore-mcp.cmd` | Windows launcher for the MCP server |
+| `hybridstore_semantic.py` | Semantic index: `index`, `search`, `status`, `gc` (see below) |
+| `test_hybridstore_semantic.py` | 7 checks for the semantic index, using a fake embedding server |
+| `llm_accuracy.py` | Scores what the LLM tools return from a store against the original files on disk |
 | `bench_results.txt` | Output of the original benchmark run (Linux container, v1 engine) |
 | `bench_results_3090.txt` | Output of the latest benchmark run on a Windows 11 / RTX 3090 PC |
 
@@ -209,7 +212,39 @@ To add it to Claude Code:
 claude mcp add hybridstore -- G:\hybrid-engine\hybrid-compression-engine\hybridstore-mcp.cmd G:\backups\my.hcs
 ```
 
-Not done yet: semantic search (an embedding per chunk, keyed by chunk hash, so deduplicated data is embedded once).
+#### Semantic search (search by meaning)
+
+`search` finds exact words. `semantic_search` finds passages that *mean* the same as the question, for example "where are passwords checked" finds `bcrypt.checkpw(...)`. It needs an index built once per store, with an embedding model served by Ollama (default `bge-m3`):
+
+```
+python hybridstore_semantic.py index  <store.hcs> [--snapshot N | --all] [--dir D] [--glob G]
+python hybridstore_semantic.py search <store.hcs> "how are corrupted blocks detected" [-k 10]
+python hybridstore_semantic.py status <store.hcs>    # model, size, how much of each snapshot is indexed
+python hybridstore_semantic.py gc     <store.hcs>    # after prune: drop entries no snapshot uses
+```
+
+* **Sidecar file.** The index is `<store>.sem` (SQLite). The store itself is never changed, and the index can be deleted and rebuilt at any time.
+* **Passages.** Text files are cut into passages of about 600-3,000 characters, at line ends chosen by the line's content (a hash), not by position. An edit early in a file therefore changes only the passages around it.
+* **Dedup carries over.** Each passage is keyed by the SHA-256 of its text and embedded once. The same passage in another file or another snapshot reuses the vector. Files are keyed by their content hash from the manifest, so a file unchanged since the last run is not even read. Indexing a new snapshot only embeds what changed.
+* **Not chunk-keyed.** Store chunks (about 8 KB, cut anywhere, even mid-line) are too large and too arbitrary for good search results, so the index uses its own line-aligned passages. They keep the same dedup property and give line numbers that match `read_file`.
+* **Coverage is reported.** Results say how many files in scope are indexed. Files added by a later backup are not searched until `index` runs again.
+* **Embedding server:** `$HYBRIDSTORE_EMBED_URL`, else `$OLLAMA_HOST`, else `127.0.0.1:11434`. An index is tied to the model that built it, and a different model is refused.
+* **Privacy.** The sidecar holds vectors and line numbers, not text. Snippets are read back from the store at search time. Vectors can still leak some information about the text, so protect the sidecar like the store.
+
+
+#### Accuracy: what the tools return vs. the original files
+
+`python llm_accuracy.py <store.hcs>` compares the tools' output from the compressed store with the original folder on disk. Measured on the project's `site-packages` (2,544 files, 83.4 MB; 100 samples; semantic index about 30% built at the time):
+
+| Check | Result |
+|---|---|
+| Bytes read from the store vs. disk | 2,544 / 2,544 files identical (100%) |
+| `read_file`, every line of every text file | 564,164 / 564,164 lines identical (100%) |
+| `search` vs. grep on the originals (103 patterns) | 2,550 / 2,550 matching lines, 0 wrong (precision and recall 100%) |
+| `semantic_search` snippets | 2,334 / 2,334 lines identical (100%) |
+| `semantic_search` finds the passage a 3-line excerpt came from | ranked 1st 57%, top 5 78% (a passage containing the text: 60% / 81%) |
+
+The exact tools reproduce the data exactly. Semantic search is a ranking, not an exact lookup: it is for questions by meaning, and `search` is the tool for exact text.
 
 ### Deleting snapshots: `prune` (Phase 2, step 2)
 

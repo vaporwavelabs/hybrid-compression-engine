@@ -202,7 +202,7 @@ def _():
         r = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         names = [t["name"] for t in r["result"]["tools"]]
         assert names == ["list_snapshots", "list_files", "read_file", "search", "diff_snapshots",
-                         "file_history"], names
+                         "semantic_search", "file_history"], names
         assert all(t["inputSchema"]["type"] == "object" for t in r["result"]["tools"])
         r = rpc(proc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                        "params": {"name": "read_file", "arguments": {"path": "docs/utf16.txt"}}})
@@ -241,7 +241,7 @@ def _():
     p = subprocess.run(exe + [STORE, "--call", "read_file", json.dumps({"path": "nope"})], capture_output=True)
     assert p.returncode == 1 and b"error:" in p.stdout, p
     p = subprocess.run(exe + ["--tools"], capture_output=True)
-    assert p.returncode == 0 and len(json.loads(p.stdout)) == 6
+    assert p.returncode == 0 and len(json.loads(p.stdout)) == 7
     p = subprocess.run(exe + [os.path.join(TMP, "missing.hcs")], capture_output=True)
     assert p.returncode == 2 and b"store not found" in p.stderr, p
 
