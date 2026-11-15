@@ -26,6 +26,7 @@ It lists five Phase I bugs and Phase II fixes: a naive XOR boundary test (fix: a
 | `hybridstore_semantic.py` | Semantic index: `index`, `search`, `status`, `gc` (see below) |
 | `test_hybridstore_semantic.py` | 7 checks for the semantic index, using a fake embedding server |
 | `llm_accuracy.py` | Scores what the LLM tools return from a store against the original files on disk |
+| `semantic_eval.py` | Scores semantic search on questions a chat model writes in its own words |
 | `bench_results.txt` | Output of the original benchmark run (Linux container, v1 engine) |
 | `bench_results_3090.txt` | Output of the latest benchmark run on a Windows 11 / RTX 3090 PC |
 
@@ -242,10 +243,11 @@ python hybridstore_semantic.py gc     <store.hcs>    # after prune: drop entries
 | Bytes read from the store vs. disk | 2,544 / 2,544 files identical (100%) |
 | `read_file`, every line of every text file | 564,164 / 564,164 lines identical (100%) |
 | `search` vs. grep on the originals (103 patterns) | 2,550 / 2,550 matching lines, 0 wrong (precision and recall 100%) |
-| `semantic_search` snippets | 2,356 / 2,356 lines identical (100%) |
-| `semantic_search` finds the passage a 3-line excerpt came from | ranked 1st 81%, top 5 92% (a passage containing the text: 89% / 93%) |
+| `semantic_search` snippets | 2,337 / 2,337 lines identical (100%) |
+| `semantic_search` finds the passage a 3-line excerpt came from | ranked 1st 79%, top 5 92% (a passage containing the text: 87% / 93%) |
+| `semantic_search` finds the passage behind a question in other words (`semantic_eval.py`) | passage: 1st 5%, top 5 12%; right file: 1st 20%, top 5 33% |
 
-The exact tools reproduce the data exactly. Semantic search is a ranking, not an exact lookup: it is for questions by meaning, and `search` is the tool for exact text. By similarity alone it scored 39% / 63% (`--no-rerank`), because near-identical code (numpy's `hermite.py` vs `laguerre.py`) and data files crowd out the right passage; the word-match re-ranking fixes most of that. The test queries are verbatim excerpts, which favours word matching: expect less gain for questions phrased in other words.
+The exact tools reproduce the data exactly. Semantic search is a ranking, not an exact lookup: it is for questions by meaning, and `search` is the tool for exact text. By similarity alone it scored 39% / 63% (`--no-rerank`), because near-identical code (numpy's `hermite.py` vs `laguerre.py`) and data files crowd out the right passage; the word-match re-ranking fixes most of that. For questions phrased in other words it is much weaker. `python semantic_eval.py <store.hcs>` has a chat model write one plain-language question per sampled passage (100 passages from `.py` files, `gemma3:12b`) and searches for each among all 26,320 passages: the source passage comes first 5% of the time and the right file is in the top 5 for 33%. Re-ranking does not help there (similarity alone: file first 16%), and a word-match weight above 0.5 makes it worse, so the weight is 0.25. Treat `semantic_search` as a way to get leads, then confirm with `search` and `read_file`.
 
 ### Deleting snapshots: `prune` (Phase 2, step 2)
 

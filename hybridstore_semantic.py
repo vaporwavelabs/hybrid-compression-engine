@@ -35,7 +35,7 @@ import numpy as np
 import hybridstore as hs
 
 SCHEMA = 1
-POOL, LEX_WEIGHT = 200, 0.5     # re-rank the best POOL passages: similarity + LEX_WEIGHT * word match
+POOL, LEX_WEIGHT = 200, 0.25    # re-rank the best POOL passages: similarity + LEX_WEIGHT * word match
 MIN_CHARS, TARGET_MASK, MAX_CHARS = 600, 7, 3000   # passage size: >= MIN, cut on hash & MASK == 0, <= MAX
 MAX_FILE = 4 << 20                                 # default: skip text files larger than this
 BATCH = 32
