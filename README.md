@@ -206,7 +206,7 @@ python hybridstore_mcp.py --tools                                  # tool schema
 To add it to Claude Code:
 
 ```
-claude mcp add hybridstore -- G:\path	o\hybridstore-mcp.cmd G:\path	oackups.hcs
+claude mcp add hybridstore -- G:\hybrid-engine\hybrid-compression-engine\hybridstore-mcp.cmd G:\backups\my.hcs
 ```
 
 Not done yet: semantic search (an embedding per chunk, keyed by chunk hash, so deduplicated data is embedded once).
