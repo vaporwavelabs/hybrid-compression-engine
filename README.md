@@ -17,11 +17,11 @@ It lists five Phase I bugs and Phase II fixes: a naive XOR boundary test (fix: a
 | `hybridstore.py` | The engine and CLI (commands below) |
 | `bench.py` | Builds the sample datasets, checks round trips, runs an incremental-backup run and the corruption test, compares against baselines |
 | `bench_large.py` | Packs, verifies and restores one large file (default 2 GiB) and reports peak memory |
-| `test_hybridstore.py` | 32 checks: streaming, snapshots, v1 compatibility, crash recovery, path safety, large media, locking, skipped files, strict verify, decompression bombs, metadata, unchanged-file reuse, prune (copy/repack/dictionary, policies, dry run, refusals), and the safeguards (damaged footers and manifests, `pack`/`unpack` refusals, files changing while read, full damage reports), Reed-Solomon parity (incremental = full rebuild, bit-exact repair of packs/manifests/footers/header, refusal beyond capacity, stale or damaged sidecar), `--pack-mb` / `--fsync` |
+| `test_hybridstore.py` | 40 checks (`HS_TEST_ONLY=encrypt,parity` runs a subset): streaming, snapshots, v1 compatibility, crash recovery, path safety, large media, locking, skipped files, strict verify, decompression bombs, metadata, unchanged-file reuse, prune (copy/repack/dictionary, policies, dry run, refusals), and the safeguards (damaged footers and manifests, `pack`/`unpack` refusals, files changing while read, full damage reports), Reed-Solomon parity (incremental = full rebuild, bit-exact repair of packs/manifests/footers/header, refusal beyond capacity, stale or damaged sidecar), interleaved parity (2 MiB bursts, `--m 4`), encryption (no plaintext on disk, wrong password vs damage, padding, CLI, MCP), `repair --dry-run`, cloud placeholders, `--pack-mb` / `--fsync` |
 | `FORMAT.md` | Byte-level specification of the store format |
 | `hybridstore.cmd` | Windows launcher that uses the local `.venv` |
 | `hybridstore_mcp.py` | Read-only MCP server: lets an LLM list, read, search and diff snapshots without unpacking (see below) |
-| `test_hybridstore_mcp.py` | 10 checks for the MCP server: each tool, paging, encodings, path safety, the stdio protocol, prune while the server runs |
+| `test_hybridstore_mcp.py` | 11 checks for the MCP server: each tool, paging (also inside very long lines), encodings, path safety, the stdio protocol, prune while the server runs |
 | `hybridstore-mcp.cmd` | Windows launcher for the MCP server |
 | `hybridstore_semantic.py` | Semantic index: `index`, `search`, `status`, `gc` (see below) |
 | `test_hybridstore_semantic.py` | 7 checks for the semantic index, using a fake embedding server |
@@ -29,8 +29,12 @@ It lists five Phase I bugs and Phase II fixes: a naive XOR boundary test (fix: a
 | `semantic_eval.py` | Scores semantic search on questions a chat model writes in its own words |
 | `bench_results.txt` | Output of the original benchmark run (Linux container, v1 engine) |
 | `bench_results_3090.txt` | Output of the latest benchmark run on a Windows 11 / RTX 3090 PC |
+| `bench_integrity.py` | Ratio, parity overhead and 200-bit-flip repair on the RDC comparison corpora |
+| `monitor.py` | Runs any command and prints elapsed time, MB read, MB/s, ETA, CPU cores and RAM every 10 s (optional CSV) |
+| `real_run.py` | Full real-data run under the monitor: pack, unchanged backup, verify, restore + SHA-256 compare, encrypted pack, damage + repair, `zstd -19 --long` baseline |
+| `TROUBLESHOOTING.md` | What to do when something goes wrong, with sources |
 
-Requirements: Python 3.10+, numpy, `zstandard` (optional; without it only zlib is used), and Pillow (optional, for near-duplicate image hashing).
+Requirements: Python 3.10+, numpy, `zstandard` (optional; without it only zlib is used), Pillow (optional, for near-duplicate image hashing), `cryptography` (optional, only for `--encrypt`) and `psutil` (optional, only for `monitor.py`).
 
 ### Commands
 
@@ -40,8 +44,12 @@ python hybridstore.py backup <input_dir> <store> [--level N] [--workers N] [--re
 python hybridstore.py list   <store> [--skipped]                 # show snapshots (and what each could not read)
 python hybridstore.py unpack <store> <output_dir> [--snapshot N] [--force]  # default: newest; --force replaces existing files
 python hybridstore.py verify <store> [--allow-partial]           # check everything; lists ALL damage and affected files
-python hybridstore.py repair <store>                             # fix damaged footers; never loses data
+python hybridstore.py repair <store> [--dry-run]                 # rebuild from parity, fix footers; never loses data
+python hybridstore.py parity <store> [--m 2|4] [--remove]        # add/refresh parity; --m 4 doubles burst tolerance
+python hybridstore.py passwd <store> [--new-password-file F]     # change an encrypted store's password
 ```
+
+`pack`/`backup` also take `--encrypt` (new stores only), `--cloud-files` (read OneDrive placeholders, which downloads them; default: skip and report), `--pack-mb N` and `--no-parity`. Every command takes `--password-file F`; the password can also come from `HYBRIDSTORE_PASSWORD`, else the CLI asks for it.
 
 Exit codes:
 
@@ -52,6 +60,7 @@ Exit codes:
 | 2 | Refused because it would destroy data: `pack` onto an existing store, or `unpack` over existing files (use `--force`) |
 | 3 | Finished with warnings: `backup`/`pack` skipped unreadable items or stored files that kept changing while read, or `unpack` could not create some symlinks |
 | 4 | Another backup is writing to the store |
+| 5 | The store is encrypted and no password, or the wrong one, was given |
 
 The byte-level format is specified in [FORMAT.md](FORMAT.md).
 
@@ -81,8 +90,9 @@ python hybridstore.py repair <store>     # rebuilds damaged bytes from parity, t
 python hybridstore.py parity <store>     # add / refresh parity for an existing (verified) store
 ```
 
-* **What it covers:** every byte of the store, including manifests, footers and the dictionary, cut into 64 KiB shards; each 1 MiB group of 16 shards gets 2 parity shards (12.5% of the store; small stores pay a little more for the last partial group).
-* **What it repairs:** any 2 damaged shards per group, data or parity, i.e. bit flips, bad sectors, and bursts up to 128 KiB per MiB. More than that is reported as beyond repair and nothing is written.
+* **What it covers:** every byte of the store, including manifests, footers, the dictionary and the encryption key block, cut into 64 KiB shards; each group of 16 shards gets 2 parity shards (12.5% of the store; small stores pay a little more for the last partial group).
+* **Interleaved:** a group's 16 shards are not neighbours. Within each 16 MiB super-group, group *j* takes every 16th shard, so a contiguous burst is spread over 16 groups. A single burst of up to **2 MiB per 16 MiB** (32 shards) is rebuilt bit-exact; with `parity --m 4` (25% overhead) up to 4 MiB. Without interleaving the limit was 128 KiB. Sidecars written before interleaving are still read and kept as they were.
+* **What it repairs:** any 2 (or `--m`) damaged shards per group, data or parity, i.e. bit flips, bad sectors and bursts as above. More than that is reported as beyond repair, and only groups that hash correctly are written.
 * **Why it is safe:** each shard's BLAKE2b is recorded, so damage is located exactly, and a rebuilt shard is written only if it hashes to the recorded value. Parity can never "repair" the store into something else, even if it is stale or belongs to another store. A backup refuses to compute new parity over old damage.
 * **Measured** (`bench_integrity.py`, same corpora and seed as the RDC comparison; Windows, 3090 PC, 2026-11-16):
 
@@ -95,6 +105,42 @@ python hybridstore.py parity <store>     # add / refresh parity for an existing 
   The RDC report's RS(12,10) repaired 193/200 at about 19% overhead and does not cover its manifest. Parity here is 12.5% per full 1 MiB group; these small stores pay more for the partial last group. Restores of many small files run at 5-9 MB/s on Windows (file creation dominates; 246 MB/s on the mixed corpus); `--fsync` costs a lot on Windows (0.4 MB/s on the small-file corpora), so it stays opt-in.
 
 Other options from the same review: `pack/backup --pack-mb 4` uses 4 MB solid packs, about 5% smaller on text (12% → 6% behind `zstd -19 --long` on the code corpus) at about 3x slower first reads of a file (2 → 7 ms); `unpack --fsync` makes each restored file durable before it is renamed into place.
+
+### Real-data run (`real_run.py`, 2026-11-16)
+
+`Desktop\Projects` on the 3090 PC (C: NVMe → D: external exFAT USB HDD): 53,846 files, 2,467 MB of three copies of a web-app repo (`.git`, `node_modules`, images and art sources) plus smaller projects. Every step ran under `monitor.py`:
+
+| step | time | notes |
+|---|---|---|
+| `pack` (zstd 19, parity on) | 112 s | 22 MB/s, 8.4 of 16 cores, peak RAM 1.3 GiB. Store 794 MB (**3.11x**), parity +100 MB (12.5%) |
+| `backup`, nothing changed | 7 s | 54k files skipped by size + mtime |
+| `verify` (everything) | 9 s | 236 MB/s |
+| `unpack` to D: | 687 s | 78 files/s: file creation on an exFAT USB HDD dominates. Exit 3: the 3 junctions could not be created (exFAT has no links) |
+| compare restore vs source (SHA-256) | 647 s | 53,846 of 53,846 files identical, 0 differ, 0 extra |
+| `pack --encrypt` | 115 s | 798 MB: +0.55% for nonces, tags and 4 KiB padding |
+| `verify` encrypted | 10 s | 246 MB/s |
+| damage: 1 MiB burst + 100 bit flips | | `verify` exit 1, lists every damaged pack and file |
+| `repair` | 13 s | all repaired from parity |
+| `verify` after repair | 9 s | clean, exit 0 |
+| `tar \| zstd -19 --long=27`, all threads | 141 s | same 2,467 MB, links not followed: 1,577 MB (1.56x), 11.8 cores, 3.7 GiB RAM |
+
+The store is **50% smaller than `zstd -19 --long`** (43% with parity included) and faster to write, because the three repo copies are hundreds of MB apart in a tar stream (beyond zstd's 128 MiB window) but deduplicate chunk by chunk here. Results: `D:\hcs-real\real_run.json`; per-2-second samples: `D:\hcs-real\pack.csv`.
+
+Lessons from this run (now in TROUBLESHOOTING.md): junctions are stored as links, not followed, so a junction to `node_modules` is not backed up twice; links cannot be restored to exFAT/FAT drives; on NTFS a junction is restored as a directory symlink, which needs Developer Mode or admin.
+
+### Encryption (`--encrypt`)
+
+```
+python hybridstore.py pack <dir> <store> --encrypt --password-file pw.txt
+python hybridstore.py backup <dir> <store> --password-file pw.txt      # stays encrypted
+python hybridstore.py passwd <store> --password-file old.txt --new-password-file new.txt
+```
+
+* **How:** a random 256-bit data key seals every block (packs, manifests, dictionary) with ChaCha20-Poly1305 and a fresh 96-bit nonce. The data key is wrapped by a key derived from the password with scrypt (N=2^17, r=8, p=1: 128 MiB, about 0.5 s per unlock; the OWASP minimum) and stored in a small key block after the store header. File names, sizes, contents and the file list are all inside the ciphertext. A sealed block's header carries no plaintext size, and its payload is padded to 4 KiB, so media files (one block each) do not reveal their exact sizes.
+* **Damage vs wrong password:** each sealed block still has a CRC of its ciphertext, so `verify` reports damage as damage. A wrong password is reported as a wrong password (exit 5), not as corruption. Parity works on the ciphertext and needs no password: `repair` and `parity` run without it.
+* **Dedup still works** inside one store (chunk hashes are only in the encrypted manifests). Two stores with different keys do not dedup against each other.
+* **`passwd`** rewrites only the key block (the data key stays the same), then refreshes parity. Old copies of the store, and anyone who already has the old password and a copy, can still read the old data; to revoke, re-pack into a new store.
+* **Limits:** the semantic index (`hybridstore_semantic.py index`) refuses an encrypted store, because the `.sem` file would hold readable text, unless `--allow-plaintext-index`. The MCP server takes `--password-file` or `HYBRIDSTORE_PASSWORD` and never prompts. A store stops accepting blocks after 2^30 (random-nonce safety margin; far beyond any real store).
 
 ### Hardening (Phase 1)
 

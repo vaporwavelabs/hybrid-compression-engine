@@ -8,7 +8,8 @@ All integers are little-endian. Offsets are absolute byte offsets in the file.
 
 ```
 offset 0   "HCSTORE1"                                   8 bytes, store magic
-           [dictionary block]                           optional, only directly after the magic
+           [key block]                                  encrypted stores only, directly after the magic
+           [dictionary block]                           optional, directly after the magic / key block
            snapshot 1: pack blocks... | manifest block | footer
            snapshot 2: pack blocks... | manifest block | footer
            ...
@@ -53,7 +54,7 @@ Bytes after that point are **trailing bytes**:
 If following the manifests' `prev` links fails (a manifest does not decode),
 a reader can still rebuild the snapshot list, because every byte belongs to
 a block or footer in a fixed order: walk the block headers from the start
-(after the dictionary), collecting packs until a MANIFEST block; the 16 bytes
+(after the key block and dictionary), collecting packs until a MANIFEST block; the 16 bytes
 after a manifest are its footer. A manifest that decodes must list exactly
 the packs collected since the previous one. One that does not decode marks a
 **damaged snapshot**: its packs are known, its file list is lost. Other
@@ -79,6 +80,7 @@ payload:           stored_len bytes
   * 1 = zlib (RFC 1950)
   * 2 = zstd frame
   * 3 = neural (reserved, never written)
+  * 7 = key block (flags byte exactly 7; see section 8)
 * Other flag bits:
 
 | bit | name | meaning |
@@ -87,6 +89,7 @@ payload:           stored_len bytes
 | 0x10 | MANIFEST | block is a snapshot manifest |
 | 0x20 | DICT | block is the zstd dictionary (must be the first block) |
 | 0x40 | USES_DICT | zstd payload was compressed with the dictionary |
+| 0x80 | ENCRYPTED | payload is sealed (section 8); `crc32` is then the CRC-32 of the **stored** payload |
 
 * **Decoding limit.** A reader must reject a block whose `orig_len` exceeds
   `max(256 MiB, 256 × stored_len)`. A reader must never produce more than
@@ -257,25 +260,84 @@ record per group:  u32 group | u32 data_len | (k+m) x 16-byte BLAKE2b
                    | u32 crc32 of the fields before it | m x shard parity bytes
 ```
 
-* Defaults: shard 64 KiB, k = 16, m = 2. Group g holds store bytes
-  `[g·k·shard, (g+1)·k·shard)`, cut into k data shards; the last ones are
-  zero-padded to `shard`. Records are fixed-size, at `64 + g × record_size`.
+* Defaults: shard 64 KiB, k = 16, m = 2, interleaving depth D = 16. The
+  first u16 of the reserved bytes is D (0 means 1). Records are fixed-size, at
+  `64 + g × record_size`; `data_len` is the number of store bytes the group's
+  shards hold.
+* **Interleaving.** The store is cut into shards (store shard s = bytes
+  `[s·shard, (s+1)·shard)`, the last one zero-padded) and the shards into
+  super-groups of D·k shards. A super-group has `ng` groups: D, except the last
+  one, which has `ceil(shards_in_it / k)`. Data shard i of group j of
+  super-group q is store shard `q·D·k + i·ng + j` (zero when past the end);
+  its group number is `q·D + j`. With D = 1 this is the plain layout (group g =
+  bytes `[g·k·shard, (g+1)·k·shard)`). Consecutive shards fall into different
+  groups, so a burst of up to m·ng shards per super-group (2 MiB per 16 MiB
+  with the defaults) is repairable, versus m shards (128 KiB) per 1 MiB without
+  interleaving. `parity --m 4` doubles that at 25% overhead.
 * Parity shard j is `Σ_i C[j][i] · data_i` over GF(256) (polynomial 0x11D),
   with the Cauchy matrix `C[j][i] = 1 / (j XOR (m + i))`. Any k of the k+m
   shards determine the others.
 * The hashes are BLAKE2b-128 of each data shard (zero-padded) and each parity
   shard. They locate damage exactly, so any m damaged shards per group (data
   or parity) are erasures that can be rebuilt. A group with more is reported
-  and left alone. A burst of up to m × shard (128 KiB) per 1 MiB group is
-  repairable.
+  and left alone.
 * **Never write unproven bytes.** A rebuilt shard is written back only if its
   BLAKE2b equals the recorded one. Parity that belongs to another store or an
   older state can therefore never change the store.
-* **Updates.** After an append, only the groups from the one holding the old
-  end of the store onward are recomputed. The shards of that first group that
-  lie before the old end are checked against their recorded hashes first; if
-  one does not match, the update is refused (the old damage is repaired with
-  the old parity instead of being baked into new parity).
+* **Updates.** After an append, only the super-groups from the one holding
+  the old end of the store onward are recomputed. The shards of that first
+  super-group that lie before the old end are checked against their recorded
+  hashes first (with the old layout); if one does not match, the update is
+  refused (the old damage is repaired with the old parity instead of being
+  baked into new parity).
 * `prune` computes parity for the new store before it replaces the old one.
 * A record whose crc32 fails, or a stale `covered`, is rebuilt by `repair`
   only after the store itself verifies.
+
+## 8. Encryption
+
+Chosen when a store is created (`pack --encrypt`, or the first `backup
+--encrypt`); every later snapshot is sealed with the same key.
+
+**Key block** (right after the magic; header flags = 7, `orig_len` =
+`stored_len` = 84, `crc32` of the payload):
+
+```
+"HCK1" | u8 kdf = 1 (scrypt) | u8 log2 N | u8 r | u8 p | 16-byte salt
+| 12-byte nonce | 48 bytes = ChaCha20-Poly1305(KEK, nonce, data_key[32], AAD = the first 24 bytes)
+KEK = scrypt(password utf-8, salt, N, r, p, 32 bytes); written with N = 2^17, r = 8, p = 1
+```
+
+**Every other block** (dictionary, packs, manifests) has flag 0x80 and
+`orig_len` = 0 in the clear. The codec bits still say how the plaintext was
+compressed; compression happens first. The payload is
+
+```
+12-byte random nonce | ChaCha20-Poly1305(data_key, nonce, inner, AAD = header bytes 0..11)
+inner = u32 orig_len | u32 compressed_len | compressed bytes | zero padding
+        (padded so that len(inner) is a multiple of 4096)
+```
+
+so `stored_len` = len(inner) + 28, i.e. `stored_len` mod 4096 = 28. Neither
+the plaintext size nor the exact compressed size appears in the clear; this
+matters for media files, which are stored one per block. The AAD binds magic,
+flags, `orig_len` (0) and `stored_len`; `crc32` covers the stored payload,
+which lets `verify`, parity and the walk tell damage (CRC) from a wrong key or
+an altered block (authentication failure), and lets parity repair the store
+without the password. After decryption, `compressed_len` must fit inside
+`inner`, the inner `orig_len` must pass the same size-ratio check as a plain
+block, and the decoded length must equal it.
+
+* Readable without the password: block kinds, padded block sizes (4 KiB
+  steps), footers, the number of snapshots, the store size. Not readable: file names, sizes
+  per file, contents, chunk hashes, the dictionary, timestamps.
+* Random nonces: the collision bound for 96-bit nonces stays negligible up to
+  2^32 blocks per key (NIST SP 800-38D); writers stop at 2^30 sealed blocks.
+* Key block limits on read: 14 <= log2 N <= 20, r <= 16, p <= 4, so a
+  hostile key block cannot demand gigabytes of memory.
+* `passwd` re-seals the same data key under a new password and salt; the data
+  is not re-encrypted, so an older copy of the store (or of its key block)
+  still opens with the old password.
+* `prune` copies the key block and sealed packs as they are (same key).
+* The semantic sidecar (`<store>.sem`) is not encrypted; `hybridstore_semantic
+  index` refuses an encrypted store unless `--allow-plaintext-index`.

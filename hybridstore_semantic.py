@@ -425,6 +425,9 @@ def main(argv) -> int:
     p.add_argument("--glob", default=None, help="only files matching, e.g. *.py")
     p.add_argument("--max-file-mb", type=float, default=MAX_FILE / (1 << 20))
     p.add_argument("--model", default=None, help=f"embedding model (default {DEFAULT_MODEL}; fixed per index)")
+    p.add_argument("--allow-plaintext-index", action="store_true",
+                   help="index an ENCRYPTED store anyway: the sidecar is not encrypted, and file hashes and "
+                        "embedding vectors (which can be partly inverted to text) would be readable")
     p = sub.add_parser("search", help="find passages by meaning")
     p.add_argument("store"); p.add_argument("query")
     p.add_argument("-k", type=int, default=10)
@@ -439,6 +442,10 @@ def main(argv) -> int:
     try:
         with hs.StoreReader(a.store) as r:
             if a.cmd == "index":
+                if r.encrypted and not a.allow_plaintext_index:
+                    raise SemanticError(f"{a.store} is encrypted but {a.store}.sem would not be: it holds "
+                                        f"file hashes and embeddings, which leak content. Pass "
+                                        f"--allow-plaintext-index to index anyway")
                 snaps = r.snapshots if a.all else [r.snapshots[(a.snapshot or len(r.snapshots)) - 1]] \
                     if 1 <= (a.snapshot or len(r.snapshots)) <= len(r.snapshots) else None
                 if snaps is None:

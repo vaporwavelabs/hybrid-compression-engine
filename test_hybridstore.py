@@ -7,6 +7,7 @@ import hashlib, importlib.util, io, os, random, shutil, subprocess, sys, tempfil
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import hybridstore as hs
+np = hs.np
 
 os.makedirs(os.path.join(HERE, "bench_data"), exist_ok=True)   # gitignored; keeps temp data off C:
 TMP = tempfile.mkdtemp(prefix="hcs-test-", dir=os.path.join(HERE, "bench_data"))
@@ -14,8 +15,13 @@ rng = random.Random(1)
 passed = []
 
 
+ONLY = [x.strip().lower() for x in os.environ.get("HS_TEST_ONLY", "").split(",") if x.strip()]
+
+
 def check(name):
     def deco(fn):
+        if ONLY and not any(x in name.lower() for x in ONLY):     # HS_TEST_ONLY=parity,encrypt
+            return fn
         fn()
         passed.append(name)
         print(f"ok  {name}")
@@ -806,11 +812,19 @@ def _():
 def _():
     src, store = _par_store("par_lim")
     good = open(store, "rb").read()
-    b = bytearray(good); b[100_000:100_000 + 200_000] = os.urandom(200_000)   # 4 shards of one group
+    # Interleaved: a burst spreads over the ng groups of the (here: only) super-group, so
+    # it must cover more than 2 x ng shards to put 3 damaged shards into one group.
+    ng = -(-(-(-len(good) // hs.PARITY_SHARD)) // hs.PARITY_K)
+    n = (2 * ng + 1) * hs.PARITY_SHARD
+    assert 100_000 + n < len(good), (ng, len(good))
+    b = bytearray(good); b[100_000:100_000 + n] = os.urandom(n)
     open(store, "wb").write(b)
     done = hs.repair(store)
-    assert open(store, "rb").read() == bytes(b), "repair wrote bytes it could not prove"
-    assert any("could NOT" in d for d in done), done
+    got = np.frombuffer(open(store, "rb").read(), np.uint8)
+    g0, b0 = np.frombuffer(good, np.uint8), np.frombuffer(bytes(b), np.uint8)
+    # Groups with <= 2 damaged shards are rebuilt (proven by hash); the overloaded group is left as is.
+    assert ((got == g0) | (got == b0)).all(), "repair wrote bytes it could not prove"
+    assert (got != g0).any() and any("could NOT" in d for d in done), done
     code, out = _quiet("verify", store)
     assert code == 1 and "beyond repair" in out, out
     # parity left over from a different store: every check fails its hash, nothing is written
@@ -871,6 +885,248 @@ def _():
     out = os.path.join(TMP, "opts_out")
     assert _quiet("unpack", big, out, "--fsync")[0] == 0
     same_tree(src, out)
+
+
+
+@check("repair rewrites damaged footers and restores a hidden newest snapshot WITHOUT parity")
+def _():
+    src, store = _three_snapshots("foot_np")
+    if os.path.exists(store + ".hcp"):
+        os.remove(store + ".hcp")
+    good = open(store, "rb").read()
+    with hs.StoreReader(store) as r:
+        old_footer = r.snapshots[0].block_end
+    _flip(store, old_footer + 3)                   # an older footer
+    _flip(store, len(good) - 5)                    # the newest footer: snapshot 3 becomes hidden
+    done = hs.repair(store)
+    assert any("footer at byte" in d for d in done) and any("newest snapshot" in d for d in done), done
+    assert open(store, "rb").read() == good
+    with hs.StoreReader(store) as r:
+        assert len(r.snapshots) == 3 and r.verify() > 0
+
+
+# ---------------------------------------------------------------- encryption
+
+def _enc_tree(name):
+    src = os.path.join(TMP, name)
+    tree(src, {"secret-name-alpha.txt": b"TOP SECRET PAYLOAD " * 20_000,
+               "dir/notes.txt": text(600_000, 77), "rand.bin": os.urandom(400_000)})
+    return src
+
+
+@check("encryption: nothing readable in the file; right password restores bit-exact; wrong/none refused")
+def _():
+    src = _enc_tree("enc1")
+    store = os.path.join(TMP, "enc1.hcs")
+    w = hs.StoreWriter(store, encrypt=True, password="correct horse"); w.add_tree(src); w.close()
+    raw = open(store, "rb").read()
+    for needle in (b"TOP SECRET", b"secret-name-alpha", b"notes.txt", text(600_000, 77)[:40]):
+        assert needle not in raw, needle
+    hs._KEYS.clear()
+    for pw in (None, "wrong"):
+        try:
+            hs.StoreReader(store, password=pw)
+            raise AssertionError("opened without the right password")
+        except hs.PasswordError:
+            pass
+    with hs.StoreReader(store, password="correct horse") as r:
+        assert r.encrypted and r.verify() == 3
+        out = os.path.join(TMP, "enc1_out"); r.unpack(out)
+    same_tree(src, out)
+    # appending stays encrypted, needs the password (cached in-process here), and dedups
+    tree(src, {"more.txt": b"TOP SECRET PAYLOAD " * 1000})
+    w = hs.StoreWriter(store, append=True); w.add_tree(src); st = w.close()
+    assert st.dedup_bytes > 0 and b"more.txt" not in open(store, "rb").read()
+    hs.prune(store, [1])
+    with hs.StoreReader(store) as r:
+        assert len(r.snapshots) == 1 and r.encrypted and r.verify() == 4
+    # --encrypt onto an unencrypted store is refused
+    plain = os.path.join(TMP, "enc_plain.hcs")
+    w = hs.StoreWriter(plain); w.add_tree(src); w.close()
+    try:
+        hs.StoreWriter(plain, append=True, encrypt=True, password="x")
+        raise AssertionError("encrypt accepted for an unencrypted store")
+    except hs.IntegrityError as e:
+        assert "not encrypted" in str(e)
+
+
+@check("encryption: damage is told apart from a wrong key; parity repairs ciphertext and the key block")
+def _():
+    src = _enc_tree("enc2")
+    store = os.path.join(TMP, "enc2.hcs")
+    w = hs.StoreWriter(store, encrypt=True, password="pw2"); w.add_tree(src); w.close()
+    good = open(store, "rb").read()
+    with hs.StoreReader(store, password="pw2") as r:
+        pack0 = r.pack_offsets[0]
+    _flip(store, pack0 + hs.HDR.size + 40)         # inside a sealed pack
+    with hs.StoreReader(store, password="pw2") as r:
+        rep = r.scan()
+    assert rep["problems"] and any("CRC" in p for p in rep["problems"]), rep["problems"]
+    hs.repair(store)
+    assert open(store, "rb").read() == good
+    hs._KEYS.clear()
+    _flip(store, 8 + hs.HDR.size + 30)             # inside the key block (the wrapped key)
+    try:
+        hs.StoreReader(store, password="pw2")
+        raise AssertionError("damaged key block accepted")
+    except hs.IntegrityError as e:
+        assert "key block" in str(e), e
+    assert hs.Parity(store).check(fix=True)["repaired_shards"] == 1    # parity needs no password
+    assert open(store, "rb").read() == good
+    with hs.StoreReader(store, password="pw2") as r:
+        assert r.verify() == 3
+
+
+@check("encryption CLI: pack --encrypt, exit 5 without password, passwd, MCP --password-file, no .sem")
+def _():
+    src = _enc_tree("enc3")
+    store = os.path.join(TMP, "enc3.hcs")
+    pw1, pw2 = os.path.join(TMP, "pw1.txt"), os.path.join(TMP, "pw2.txt")
+    open(pw1, "w").write("first password\n"); open(pw2, "w").write("second password\n")
+    hs.set_password(None); hs._KEYS.clear()
+    assert _quiet("pack", src, store, "--encrypt", "--password-file", pw1)[0] == 0
+    hs.set_password(None); hs._KEYS.clear()
+    code, out = _quiet("list", store)
+    assert code == 5 and "encrypted" in out, (code, out)
+    assert _quiet("verify", store, "--password-file", pw1)[0] == 0
+    assert _quiet("passwd", store, "--password-file", pw1, "--new-password-file", pw2)[0] == 0
+    hs.set_password(None); hs._KEYS.clear()
+    assert _quiet("list", store, "--password-file", pw1)[0] == 5
+    hs.set_password(None); hs._KEYS.clear()
+    assert _quiet("verify", store, "--password-file", pw2)[0] == 0
+    assert not hs.Parity(store).check()["bad_shards"]
+    hs.set_password(None); hs._KEYS.clear()
+    r = subprocess.run([sys.executable, os.path.join(HERE, "hybridstore_mcp.py"), "--password-file", pw2, store,
+                        "--call", "read_file", '{"path": "secret-name-alpha.txt"}'],
+                       capture_output=True, timeout=120)
+    assert r.returncode == 0 and b"TOP SECRET PAYLOAD" in r.stdout, r.stderr[-500:]
+    sem = os.path.join(HERE, "hybridstore_semantic.py")
+    r = subprocess.run([sys.executable, sem, "index", store], capture_output=True, timeout=120,
+                       env={**os.environ, "HYBRIDSTORE_PASSWORD": "second password"})
+    assert r.returncode != 0 and b"allow-plaintext-index" in r.stdout + r.stderr, r
+    assert not os.path.exists(store + ".sem")
+    hs.set_password(None); hs._KEYS.clear()
+
+
+# ---------------------------------------------------------------- interleaved parity
+
+def _big_store(name, mb=20):
+    src = os.path.join(TMP, name)
+    tree(src, {f"r{i}.bin": os.urandom(1 << 20) for i in range(mb)})     # incompressible: store ~= mb MiB
+    store = os.path.join(TMP, name + ".hcs")
+    w = hs.StoreWriter(store); w.add_tree(src); w.close()
+    return src, store
+
+
+@check("interleaved parity: a 2 MiB burst is rebuilt bit-exact; --m 4 survives 4 MiB; depth-1 sidecars still work")
+def _():
+    src, store = _big_store("burst")
+    good = open(store, "rb").read()
+    assert len(good) > 17 << 20
+    p = hs.Parity(store).params()
+    assert p["depth"] == 16 and p["m"] == 2
+    S = hs.PARITY_SHARD
+    tail = len(good) - 16 * 16 * S                 # bytes in the last, partial super-group
+    ng_last = -(-(-(-tail // S)) // 16)
+    # an unaligned burst of L bytes touches up to L/S + 1 shards; 2 per group are repairable
+    for start, n in ((3_000_000, (32 - 1) * S), (len(good) - (2 * ng_last - 1) * S + 5, (2 * ng_last - 1) * S - 5)):
+        b = bytearray(good); b[start:start + n] = os.urandom(n); open(store, "wb").write(b)
+        done = hs.repair(store)
+        assert open(store, "rb").read() == good, (start, n, done)
+    # 3 MiB: more than m=2 can do in one super-group -> some groups refused, never wrong bytes
+    b = bytearray(good); b[1_000_000:1_000_000 + (3 << 20)] = os.urandom(3 << 20); open(store, "wb").write(b)
+    c = hs.Parity(store).check(fix=True)
+    assert c["unrepairable_groups"]
+    got = np.frombuffer(open(store, "rb").read(), np.uint8)
+    assert ((got == np.frombuffer(good, np.uint8)) | (got == np.frombuffer(bytes(b), np.uint8))).all()
+    open(store, "wb").write(good)
+    assert _quiet("parity", store, "--m", "4")[0] == 0 and hs.Parity(store).params()["m"] == 4
+    b = bytearray(good); b[1_000_000:1_000_000 + 63 * S] = os.urandom(63 * S)
+    open(store, "wb").write(b)
+    hs.repair(store)
+    assert open(store, "rb").read() == good
+    # a backup keeps m=4 / depth 16, and incremental == full rebuild
+    tree(src, {"later.bin": os.urandom(3 << 20)})
+    w = hs.StoreWriter(store, append=True); w.add_tree(src); w.close()
+    inc = open(store + ".hcp", "rb").read()
+    hs.Parity(store).build(**hs.Parity(store).params())
+    assert open(store + ".hcp", "rb").read() == inc
+    # sidecars written before interleaving (depth 1) are still read, updated and used
+    hs.Parity(store).build(depth=1)
+    assert hs.Parity(store).params()["depth"] == 1
+    good = open(store, "rb").read()
+    _flip(store, 5_000_000)
+    hs.repair(store)
+    assert open(store, "rb").read() == good
+
+
+# ---------------------------------------------------------------- hardening (research pass)
+
+@check("encryption hides sizes: sealed headers carry no plaintext size; payloads padded to 4 KiB")
+def _():
+    src = os.path.join(TMP, "pad1")
+    tree(src, {"a.txt": b"x" * 123_457, "photo.jpg": b"\xff\xd8\xff\xe0" + os.urandom(77_777),
+               "tiny.txt": b"hi"})
+    store = os.path.join(TMP, "pad1.hcs")
+    w = hs.StoreWriter(store, encrypt=True, password="pad"); w.add_tree(src); w.close()
+    raw = open(store, "rb").read()
+    with hs.StoreReader(store, password="pad") as r:
+        offs = list(r.pack_offsets) + [s.offset for s in r.snapshots]
+        assert r.verify() > 0
+        out = os.path.join(TMP, "pad1_out"); r.unpack(out)
+    same_tree(src, out)
+    for off in offs:
+        magic, flags, olen, slen, _crc = hs.HDR.unpack_from(raw, off)
+        assert flags & hs.FLAG_ENCRYPTED and olen == 0, (off, flags, olen)
+        assert (slen - 28) % hs.SEAL_PAD == 0, (off, slen)
+    assert hs.MAX_SEALED_BLOCKS >= 1 << 20
+
+
+@check("repair --dry-run reports the plan and changes nothing; the real repair then fixes it")
+def _():
+    src, store = _three_snapshots("dry")
+    good = open(store, "rb").read()
+    with hs.StoreReader(store) as r:
+        old_footer = r.snapshots[0].block_end
+    _flip(store, 200)
+    _flip(store, old_footer + 2)
+    bad = open(store, "rb").read()
+    plan = hs.repair(store, dry_run=True)
+    assert plan and any("parity" in p for p in plan), plan
+    assert open(store, "rb").read() == bad
+    code, out = _quiet("repair", store, "--dry-run")
+    assert code == 0 and "nothing was changed" in out, out
+    assert open(store, "rb").read() == bad
+    hs.repair(store)
+    assert open(store, "rb").read() == good
+    assert hs.repair(store, dry_run=True) == []
+
+
+@check("cloud placeholders (offline attribute) are skipped and reported; --cloud-files includes them")
+def _():
+    if os.name != "nt":
+        return
+    import ctypes
+    src = os.path.join(TMP, "cloud")
+    tree(src, {"local.txt": b"here " * 1000, "online-only.docx": b"would download " * 1000})
+    p = os.path.join(src, "online-only.docx")
+    FILE_ATTRIBUTE_OFFLINE = 0x1000
+    assert ctypes.windll.kernel32.SetFileAttributesW(p, FILE_ATTRIBUTE_OFFLINE)
+    try:
+        store = os.path.join(TMP, "cloud.hcs")
+        w = hs.StoreWriter(store); w.add_tree(src); st = w.close()
+        assert any("online-only" in s[0] and "cloud placeholder" in s[1] for s in st.skipped), st.skipped
+        code, out = _quiet("list", store, "--skipped")
+        assert code == 0 and "online-only" in out, out
+        store2 = os.path.join(TMP, "cloud2.hcs")
+        w = hs.StoreWriter(store2, cloud_files=True); w.add_tree(src); st = w.close()
+        assert not st.skipped, st.skipped
+        out2 = os.path.join(TMP, "cloud2_out")
+        with hs.StoreReader(store2) as r:
+            r.unpack(out2)
+        assert open(os.path.join(out2, "online-only.docx"), "rb").read() == b"would download " * 1000
+    finally:
+        ctypes.windll.kernel32.SetFileAttributesW(p, 0x80)
 
 
 if __name__ == "__main__":

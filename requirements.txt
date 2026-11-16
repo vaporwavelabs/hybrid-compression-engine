@@ -2,3 +2,7 @@ numpy
 zstandard
 # optional: only needed by bench.py to generate image samples
 Pillow
+# optional: only needed for --encrypt (and to open encrypted stores)
+cryptography
+# optional: only needed by monitor.py / real_run.py
+psutil

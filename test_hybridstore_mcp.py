@@ -127,6 +127,32 @@ def _():
     assert "unknown store" in fails("list_snapshots", store=os.path.join(HERE, "bench_data", "set0.hcs"))
 
 
+@check("read_file pages inside a line longer than the output budget (minified / one-line files)")
+def _():
+    src, store = os.path.join(TMP, "oneline"), os.path.join(TMP, "oneline.hcs")
+    body = "".join(f"<{i}>" for i in range(60_000))                    # ~400k characters, no newline
+    tree(src, {"min.js": body.encode(), "two.txt": (body[:90_000] + "\nsecond line\n").encode()})
+    backup(src, store)
+    t2 = mcp.StoreTools({"o": store})
+    got, line, char, calls = "", 1, 0, 0
+    while True:
+        text, bad = mcp.call_tool(t2, "read_file", {"path": "min.js", "start_line": line, "start_char": char})
+        assert not bad, text
+        calls += 1
+        rows = text.split("\n")[1:]
+        got += rows[0].split("\t", 1)[1]
+        if "continues" not in rows[-1]:
+            assert "end of file" in rows[-1], rows[-1]
+            break
+        nxt = rows[-1].split("start_line=")[1]
+        line, char = int(nxt.split(",")[0]), int(nxt.split("start_char=")[1])
+        assert calls < 100
+    assert got == body and calls > 3, (len(got), calls)
+    # after the long line is done, the next call moves on to line 2
+    text, _ = mcp.call_tool(t2, "read_file", {"path": "two.txt", "start_line": 1, "start_char": 89_990})
+    assert "second line" in text and "end of file" in text, text[-200:]
+
+
 @check("search: literal, regex, case, glob, dir, context, dedup, utf-16, long lines, limits")
 def _():
     t = call("search", pattern="aardvark")

@@ -4,6 +4,8 @@
     python hybridstore_mcp.py <store.hcs> [name=<other.hcs> ...]      # MCP over stdio
     python hybridstore_mcp.py <store.hcs> --call search "{\"pattern\": \"TODO\"}"
     python hybridstore_mcp.py <store.hcs> --tools                     # tool schemas as JSON
+    Encrypted stores: --password-file FILE (before the stores) or HYBRIDSTORE_PASSWORD; the
+    server never prompts (stdin is the MCP channel).
 
 The model never sees compressed bytes: each tool call opens the store, decodes
 only the packs it needs, and returns plain text. Nothing here can write to a
@@ -228,6 +230,7 @@ class StoreTools:
     def read_file(self, a: dict) -> str:
         start = self._int(a, "start_line", 1, 1, 1 << 60)
         max_lines = self._int(a, "max_lines", 400, 1, 5000)
+        start_char = self._int(a, "start_char", 0, 0, 1 << 60)
         with self._open(a) as r:
             n, snap = self._snap(r, a.get("snapshot"))
             e = self._find(snap, a.get("path", ""))
@@ -252,7 +255,22 @@ class StoreTools:
             for no, line in enumerate(_lines(chunks(), enc), 1):
                 if no < start:
                     continue
-                if shown >= max_lines or not out.add(f"{no:>6}\t{line}"):
+                sc = start_char if no == start else 0
+                if sc:
+                    line = line[sc:]
+                if shown >= max_lines:
+                    more = True
+                    break
+                if not out.add(f"{no:>6}\t{line}"):
+                    if shown == 0:
+                        # One line longer than the whole budget (minified code, one-line JSON):
+                        # show a piece and page inside the line, so every character stays
+                        # reachable and the hint always moves forward.
+                        room = max(1000, MAX_OUT - out.n - 200)
+                        out.parts.append(f"{no:>6}\t{line[:room]}")
+                        out.parts.append(f"... line {no} continues ({len(line) - room:,} more characters): "
+                                         f"call again with start_line={no}, start_char={sc + room}")
+                        return out.text()
                     more = True
                     break
                 shown, last = shown + 1, no
@@ -460,6 +478,8 @@ TOOLS = [
          **_STORE, **_SNAP,
          "path": {"type": "string", "description": "File path inside the snapshot."},
          "start_line": {"type": "integer", "description": "First line to return (default 1)."},
+         "start_char": {"type": "integer", "description": "Character in start_line to begin at (default 0); "
+                                                          "used to page through a very long line."},
          "max_lines": {"type": "integer", "description": "Lines to return (default 400, max 5000)."}}}},
     {"name": "search",
      "description": "Search the text files of a snapshot for a string or regular expression, like grep, "
@@ -566,6 +586,10 @@ def main(argv) -> int:
     stores, rest = {}, []
     it = iter(argv)
     for arg in it:
+        if arg == "--password-file":
+            with open(next(it), encoding="utf-8") as fh:
+                hs.set_password(fh.readline().rstrip("\r\n"))
+            continue
         if arg in ("--call", "--tools", "-h", "--help"):
             rest = [arg] + list(it)
             break

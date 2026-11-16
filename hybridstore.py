@@ -87,6 +87,8 @@ FLAG_MEDIA = 0x08                   # payload is media / already-compressed data
 FLAG_MANIFEST = 0x10                # block holds a manifest
 FLAG_DICT = 0x20                    # block holds the trained zstd dictionary
 FLAG_USES_DICT = 0x40               # zstd payload was coded with the dictionary
+FLAG_ENCRYPTED = 0x80               # payload = 12-byte nonce | ChaCha20-Poly1305 ciphertext | 16-byte tag
+CODEC_KEYS = 7                      # the key block of an encrypted store (right after STORE_MAGIC)
 CODEC_NAMES = {0: "raw", 1: "zlib", 2: "zstd", 3: "neural"}
 
 SEGMENT = 8 << 20                   # streaming read size
@@ -107,10 +109,133 @@ KIND_FILE, KIND_DIR, KIND_LINK, KIND_DIRLINK = 0, 1, 2, 3
 # Windows attributes that are restored (read-only, hidden, system, archive, not-indexed)
 WIN_ATTR_KEEP = 0x1 | 0x2 | 0x4 | 0x20 | 0x2000
 WIN_ATTR_NORMAL = 0x80
+# Offline | recall-on-open | recall-on-data-access: OneDrive / cloud placeholders
+CLOUD_ATTRS = 0x1000 | 0x40000 | 0x400000
 
 
 class IntegrityError(Exception):
     pass
+
+
+class PasswordError(IntegrityError):
+    """The store is encrypted and no (or a wrong) password was given."""
+
+
+# --------------------------------------------------------------------------
+# Encryption. An encrypted store has a key block right after STORE_MAGIC:
+#     'HCK1' | u8 kdf (1 = scrypt) | u8 log2 N | u8 r | u8 p | 16-byte salt
+#     | 12-byte nonce | 48 bytes: the 32-byte data key sealed with
+#       ChaCha20-Poly1305 under scrypt(password, salt), AAD = the 24 bytes before the nonce
+# Every other block (dictionary, packs, manifests) is compressed first, then
+# sealed with the data key: payload = nonce | ciphertext | tag, AAD = the first
+# 12 header bytes (magic, flags, original length, stored length). The header's
+# crc32 then covers the sealed payload, so damage can be told apart from a
+# wrong key and located without the password. Block headers, footers and the
+# store size stay readable: an observer learns block sizes and the number of
+# snapshots, not names, contents or chunk hashes.
+# --------------------------------------------------------------------------
+KEY_MAGIC = b"HCK1"
+KEY_BLOCK = struct.Struct("<4sBBBB16s12s48s")
+SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P = 17, 8, 1          # 128 MiB, ~0.5 s per unlock (OWASP minimum)
+SEAL_PAD = 4096                                       # sealed plaintext is padded to a multiple of this
+# Random 96-bit nonces are safe for 2^32 messages per key (NIST SP 800-38D); stop
+# well before that. At ~1 MiB per pack this is far beyond any real store.
+MAX_SEALED_BLOCKS = 1 << 30
+PASSWORD_ENV = "HYBRIDSTORE_PASSWORD"
+_password: str | None = None
+_prompt_ok = False                                    # the CLI turns this on; the library never prompts
+_KEYS: dict[bytes, bytes] = {}                        # sha256(key block) -> data key, unlocked this process
+
+
+def set_password(pw: str | None):
+    """Password for encrypted stores opened or created by this process."""
+    global _password
+    _password = pw
+
+
+def _interactive() -> bool:
+    """True only for a real terminal. On Windows `NUL` and some pipes report
+    isatty() == True, and getpass would then wait on the console forever."""
+    try:
+        if not (sys.stdin and sys.stdin.isatty()):
+            return False
+        if os.name == "nt":
+            import ctypes, msvcrt
+            mode = ctypes.c_uint32()
+            return bool(ctypes.windll.kernel32.GetConsoleMode(msvcrt.get_osfhandle(sys.stdin.fileno()),
+                                                              ctypes.byref(mode)))
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _password_for(prompt: str, confirm: bool = False) -> str | None:
+    global _password
+    if _password is None and os.environ.get(PASSWORD_ENV):
+        return os.environ[PASSWORD_ENV]
+    if _password is None and _prompt_ok and _interactive():
+        import getpass
+        pw = getpass.getpass(prompt)
+        if confirm and getpass.getpass("repeat the password: ") != pw:
+            raise PasswordError("the two passwords differ")
+        _password = pw
+    return _password
+
+
+def _aead(key: bytes):
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    except ImportError as e:
+        raise IntegrityError("encrypted stores need the 'cryptography' package: pip install cryptography") from e
+    return ChaCha20Poly1305(key)
+
+
+def _kek(password: str, salt: bytes, log_n: int, r: int, p: int) -> bytes:
+    return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=1 << log_n, r=r, p=p,
+                          maxmem=(128 * r << log_n) + (64 << 20), dklen=32)
+
+
+def make_key_block(password: str, key: bytes | None = None) -> tuple[bytes, bytes]:
+    """A new key block (header + payload) sealing `key` (default: a fresh
+    random data key) under `password`. Returns (block, key)."""
+    if not password:
+        raise PasswordError("an empty password is not allowed")
+    key = key or os.urandom(32)
+    salt, nonce = os.urandom(16), os.urandom(12)
+    head = KEY_MAGIC + bytes([1, SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P]) + salt
+    wrapped = _aead(_kek(password, salt, SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P)).encrypt(nonce, key, head)
+    payload = head + nonce + wrapped
+    _KEYS[hashlib.sha256(payload).digest()] = key
+    hdr = HDR.pack(BLOCK_MAGIC, CODEC_KEYS, len(payload), len(payload), zlib.crc32(payload) & 0xFFFFFFFF)
+    return hdr + payload, key
+
+
+def open_key_block(payload: bytes, password: str | None = None) -> bytes:
+    """The data key sealed in a key block's payload."""
+    if len(payload) != KEY_BLOCK.size:
+        raise IntegrityError("the key block has the wrong size")
+    magic, kdf, log_n, r, p, salt, nonce, wrapped = KEY_BLOCK.unpack(payload)
+    # Bounded so a hostile key block cannot make us allocate gigabytes (RFC 7914 section 2).
+    if magic != KEY_MAGIC or kdf != 1 or not (14 <= log_n <= 20 and 1 <= r <= 16 and 1 <= p <= 4):
+        raise IntegrityError("the key block is damaged or of an unknown kind")
+    cached = _KEYS.get(hashlib.sha256(payload).digest())
+    if cached is not None:
+        return cached
+    pw = password if password is not None else _password_for("store password: ")
+    if pw is None:
+        raise PasswordError(f"this store is encrypted: give its password (--password-file FILE, the "
+                            f"{PASSWORD_ENV} environment variable, or type it when asked)")
+    try:
+        from cryptography.exceptions import InvalidTag
+    except ImportError:
+        InvalidTag = ValueError
+    try:
+        key = _aead(_kek(pw, salt, log_n, r, p)).decrypt(nonce, wrapped, payload[:24])
+    except InvalidTag:
+        raise PasswordError("wrong password (or a damaged key block: `repair` rebuilds it if the store "
+                            "has parity)") from None
+    _KEYS[hashlib.sha256(payload).digest()] = key
+    return key
 
 
 class StoreLockedError(Exception):
@@ -445,6 +570,10 @@ class BlockCodec:
         self._dict = self.zd_dict = None
         self._tls = threading.local()
         self.neural = NeuralCodec()
+        self.cipher = None              # ChaCha20Poly1305 when the store is encrypted
+
+    def set_key(self, key: bytes | None):
+        self.cipher = _aead(key) if key else None
 
     def _compressors(self):
         c = getattr(self._tls, "c", None)
@@ -488,8 +617,23 @@ class BlockCodec:
             out = fn()
             if len(out) < len(best):
                 best_codec, best = codec, out
-        crc = zlib.crc32(data) & 0xFFFFFFFF
-        hdr = HDR.pack(BLOCK_MAGIC, flags | best_codec, len(data), len(best), crc)
+        flags |= best_codec
+        olen = len(data)
+        if self.cipher is not None:
+            # Sealed: u32 orig_len | compressed | zero padding, so neither the plaintext
+            # size nor the exact compressed size shows in the clear (the header's
+            # orig_len is 0). Matters for media files, which are stored one per block.
+            flags |= FLAG_ENCRYPTED
+            inner = struct.pack("<II", olen, len(best)) + best
+            inner += b"\0" * (-len(inner) % SEAL_PAD)
+            nonce = os.urandom(12)
+            aad = HDR.pack(BLOCK_MAGIC, flags, 0, 12 + len(inner) + 16, 0)[:12]
+            best = nonce + self.cipher.encrypt(nonce, inner, aad)
+            crc = zlib.crc32(best) & 0xFFFFFFFF
+            olen = 0
+        else:
+            crc = zlib.crc32(data) & 0xFFFFFFFF
+        hdr = HDR.pack(BLOCK_MAGIC, flags, olen, len(best), crc)
         return hdr + best, {"codec": best_codec & CODEC_MASK, "dict": bool(best_codec & FLAG_USES_DICT),
                             "raw_fallback": best_codec == CODEC_RAW}
 
@@ -502,6 +646,28 @@ class BlockCodec:
             raise IntegrityError(f"truncated payload at {off}")
         if olen > max(BLOCK_FLOOR, BLOCK_RATIO * slen):
             raise IntegrityError(f"block at {off} claims an implausible size ({olen:,} bytes from {slen:,})")
+        sealed = bool(flags & FLAG_ENCRYPTED)
+        if sealed:
+            if zlib.crc32(payload) & 0xFFFFFFFF != crc:
+                raise IntegrityError(f"CRC mismatch in encrypted block at {off} (damaged on disk)")
+            if self.cipher is None:
+                raise PasswordError(f"block at {off} is encrypted and no key is loaded")
+            if slen < 28:
+                raise IntegrityError(f"encrypted block at {off} is too short")
+            try:
+                inner = self.cipher.decrypt(payload[:12], payload[12:], hdr[:12])
+            except Exception:
+                raise IntegrityError(f"encrypted block at {off} failed authentication (altered, "
+                                     f"or sealed with another key; repeated failures on intact "
+                                     f"CRCs can also mean bad RAM)") from None
+            olen, clen = struct.unpack_from("<II", inner)
+            payload = inner[8:8 + clen]
+            if len(payload) != clen:
+                raise IntegrityError(f"encrypted block at {off} is malformed")
+            if olen > max(BLOCK_FLOOR, BLOCK_RATIO * slen):
+                raise IntegrityError(f"block at {off} claims an implausible size ({olen:,} bytes)")
+            if flags & CODEC_MASK == CODEC_RAW:
+                payload = payload[:olen]
         codec = flags & CODEC_MASK
         try:
             if codec == CODEC_RAW:
@@ -529,7 +695,7 @@ class BlockCodec:
             raise
         except Exception as e:
             raise IntegrityError(f"decode failed at {off}: {e}") from e
-        if len(data) != olen or (zlib.crc32(data) & 0xFFFFFFFF) != crc:
+        if len(data) != olen or (not sealed and (zlib.crc32(data) & 0xFFFFFFFF) != crc):
             raise IntegrityError(f"CRC/length mismatch in block at {off}")
         return data, flags
 
@@ -758,7 +924,8 @@ class StoreWriter:
     def __init__(self, path: str, chunker: FastCDC | None = None, codec: BlockCodec | None = None,
                  pack_target: int = 1 << 20, near_dup_hamming: int = 6,
                  append: bool = False, label: str = "", workers: int | None = None,
-                 max_pending_bytes: int = 256 << 20, parity: bool | None = None):
+                 max_pending_bytes: int = 256 << 20, parity: bool | None = None,
+                 encrypt: bool = False, password: str | None = None, cloud_files: bool = False):
         """workers: threads for reading/chunking small files, hashing large
         ones and compressing packs (default: CPU count, max 16; 1 = no
         threads). Output is byte-identical whatever the worker count, except
@@ -772,8 +939,15 @@ class StoreWriter:
         parity: None (default) = a new store gets a Reed-Solomon sidecar
         '<path>.hcp' and an existing sidecar is kept up to date; True = also
         create one for an existing store that has none; False = no parity
-        (a new store's stale sidecar is removed)."""
+        (a new store's stale sidecar is removed).
+
+        encrypt: seal every block of a NEW store with a random key, itself
+        sealed under the password (argument, set_password(), or the
+        HYBRIDSTORE_PASSWORD environment variable). Appending to an encrypted
+        store needs the same password and always stays encrypted."""
         self.parity_mode = parity
+        self.encrypt, self.password = encrypt, password
+        self.cloud_files = cloud_files          # False: skip (and report) cloud placeholders
         self.lock = _StoreLock(path)
         try:
             self._init(path, chunker, codec, pack_target, near_dup_hamming, append, label,
@@ -800,7 +974,10 @@ class StoreWriter:
         self.prev_snapshots: list[Snapshot] = []
         self.recovered_bytes = 0               # tail bytes dropped from an interrupted write
         if append and os.path.exists(path) and os.path.getsize(path) > 0:
-            with StoreReader(path, codec=self.codec, load_index=True) as r:
+            with StoreReader(path, codec=self.codec, load_index=True, password=self.password) as r:
+                if self.encrypt and not r.encrypted:
+                    raise IntegrityError(f"{path} is not encrypted; encryption is chosen when a store is "
+                                         f"created (pack --encrypt into a new store)")
                 if r.tail_snapshot is not None:
                     raise IntegrityError(
                         f"{path}: the newest snapshot (#{len(r.snapshots) + 1}) is complete but its footer "
@@ -820,10 +997,23 @@ class StoreWriter:
             self.pos = self.start = end
             self.created = False
         else:
+            self.codec.set_key(None)
+            if self.encrypt:
+                pw = self.password if self.password is not None else _password_for(
+                    "password for the new store: ", confirm=True)
+                if pw is None:
+                    raise PasswordError(f"--encrypt needs a password (--password-file FILE or the "
+                                        f"{PASSWORD_ENV} environment variable)")
+                key_block, key = make_key_block(pw)
+                self.codec.set_key(key)
             self.f = open(path + ".hcs-new", "wb")
             self.f.write(STORE_MAGIC)
             self.pos = self.start = len(STORE_MAGIC)
+            if self.encrypt:
+                self.f.write(key_block)
+                self.pos += len(key_block)
             self.created = True
+        self.header_end = self.pos
         self.first_new_pack = len(self.pack_offsets)
         self.next_pack = len(self.pack_offsets)  # id of the pack being filled
         self.open_pack: list[bytes] = []
@@ -842,6 +1032,8 @@ class StoreWriter:
 
     # ---- packs ----
     def _write_block(self, block: bytes, info: dict, payload_len: int):
+        if self.codec.cipher is not None and len(self.pack_offsets) + len(self.prev_snapshots) >= MAX_SEALED_BLOCKS:
+            raise IntegrityError("this encrypted store has reached its per-key block limit; start a new store")
         self.pack_offsets.append(self.pos)
         self.f.write(block)
         self.pos += len(block)
@@ -992,7 +1184,7 @@ class StoreWriter:
     def train_dictionary(self, samples: list[bytes], dict_size: int = 112 * 1024):
         """Train a zstd dictionary and store it as the first block. Only
         possible on a new, still-empty store."""
-        if not self.created or self.pos != len(STORE_MAGIC):
+        if not self.created or self.pos != self.header_end:
             return False
         if not zstd or len(samples) < 8 or sum(map(len, samples)) < 8 * dict_size:
             return False
@@ -1045,6 +1237,12 @@ class StoreWriter:
                     st = de.stat(follow_symlinks=False) if kind == KIND_FILE else os.lstat(full)
                 except OSError as e:
                     self._skip(os.path.relpath(full, root), e)
+                    continue
+                if kind == KIND_FILE and not self.cloud_files and \
+                        getattr(st, "st_file_attributes", 0) & CLOUD_ATTRS:
+                    self.stats.skipped.append((_norm_path(os.path.relpath(full, root)),
+                                               "cloud placeholder, not downloaded (reading it would download it; "
+                                               "use --cloud-files to include)"))
                     continue
                 yield full, kind, st
                 if kind == KIND_DIR:
@@ -1118,7 +1316,7 @@ class StoreWriter:
                         if p.size == st.st_size and p.mtime_ns == st.st_mtime_ns:
                             reuse[full] = (p, st)
         files = [full for full, kind, _ in items if kind == KIND_FILE and full not in reuse]
-        if use_dictionary and self.created and self.pos == len(STORE_MAGIC):
+        if use_dictionary and self.created and self.pos == self.header_end:
             seen, samples, budget = set(), [], sample_budget
             for full in files:
                 try:
@@ -1316,25 +1514,42 @@ class StoreReader:
     or file size (apart from the manifests and a small pack cache)."""
 
     def __init__(self, path: str, codec: BlockCodec | None = None, cache_bytes: int = 256 << 20,
-                 load_index: bool = False):
+                 load_index: bool = False, password: str | None = None):
         self.f = open(path, "rb")
         try:
-            self._open(codec, cache_bytes, load_index)
+            self._open(codec, cache_bytes, load_index, password)
         except Exception:
             self.f.close()
             raise
 
-    def _open(self, codec, cache_bytes, load_index):
+    def _open(self, codec, cache_bytes, load_index, password=None):
         self.codec = codec or BlockCodec()
         self.f.seek(0, os.SEEK_END)
         self.file_size = size = self.f.tell()
         if size < 8 + FOOTER.size or self._read(0, 8) != STORE_MAGIC:
             raise IntegrityError("not a hybrid store")
-        self.has_dict = False
-        if size > 8 + HDR.size and HDR.unpack(self._read(8, HDR.size))[1] & FLAG_DICT:
-            d, _, _ = self._block(8)
+        self.has_dict = self.encrypted = False
+        self.key_block, self.dict_off = None, None
+        pos = len(STORE_MAGIC)
+        hdr = self._read(pos, HDR.size)
+        if len(hdr) == HDR.size and hdr[:3] == BLOCK_MAGIC and hdr[3] == CODEC_KEYS:
+            _, _, olen, slen, crc = HDR.unpack(hdr)
+            payload = self.f.read(slen)
+            if len(payload) != slen or olen != slen or zlib.crc32(payload) & 0xFFFFFFFF != crc:
+                raise IntegrityError("the key block of this encrypted store is damaged (`repair` rebuilds it "
+                                     "from parity)")
+            self.codec.set_key(open_key_block(payload, password))
+            self.key_block, self.encrypted = hdr + payload, True
+            pos += HDR.size + slen
+            hdr = self._read(pos, HDR.size)
+        else:
+            self.codec.set_key(None)
+        if size > pos + HDR.size and len(hdr) == HDR.size and hdr[:3] == BLOCK_MAGIC and hdr[3] & FLAG_DICT:
+            d, _, end = self._block(pos)
             self.codec.set_dictionary(d)
-            self.has_dict = True
+            self.has_dict, self.dict_off = True, pos
+            pos = end
+        self.data_start = pos
         moff, self.end = self._locate_footer(size)
         try:
             chain = self._chain(moff, load_index)
@@ -1412,9 +1627,7 @@ class StoreReader:
             pos = end
 
     def _chain_by_walking(self, load_index: bool, cause: IntegrityError) -> list[Snapshot]:
-        start = len(STORE_MAGIC)
-        if self.has_dict:
-            start += HDR.size + HDR.unpack(self._read(start, HDR.size))[3]
+        start = self.data_start
         chain, packs, n_packs, prev = [], [], 0, 0
         for kind, off, flags, end in self._walk_blocks(start, self.end):
             if kind == "bad":
@@ -1749,6 +1962,8 @@ class StoreReader:
                 raise IntegrityError(f"no block header at {off}")
             return off + HDR.size + HDR.unpack(hdr)[3]
         pos = len(STORE_MAGIC)
+        if self.encrypted:
+            pos = end_of(pos)
         if self.has_dict:
             pos = end_of(pos)
         for s in self.snapshots:
@@ -1884,6 +2099,12 @@ class StoreReader:
 PARITY_MAGIC = b"HCPAR001"
 PAR_HDR = struct.Struct("<8sIHHQI32sI")          # magic, shard, k, m, covered, groups, reserved, crc
 PARITY_SHARD, PARITY_K, PARITY_M = 64 << 10, 16, 2
+# Interleaving: groups are formed across a "super-group" of DEPTH x K shards
+# (16 MiB), data shard i of group j being store shard i*DEPTH + j. A burst of
+# damage then spreads over DEPTH groups: with M = 2, any 2 MiB burst per 16 MiB
+# is repairable instead of 128 KiB per 1 MiB. Stored in the header's first
+# reserved u16 (0 = 1 = no interleaving, the original layout).
+PARITY_DEPTH = 16
 
 
 def _gf_tables():
@@ -1952,7 +2173,8 @@ class Parity:
     """The '<store>.hcp' sidecar. Layout: a 64-byte header, then one fixed-size
     record per group: u32 group | u32 data_len | (K+M) x 16-byte BLAKE2b (data
     shards zero-padded to SHARD, then parity shards) | u32 crc32 of the fields
-    before it | M x SHARD parity bytes."""
+    before it | M x SHARD parity bytes. Groups are interleaved inside
+    super-groups of DEPTH x K shards; see FORMAT.md section 7."""
 
     def __init__(self, store: str):
         self.store, self.path = store, store + ".hcp"
@@ -1965,28 +2187,60 @@ class Parity:
         raw = f.read(PAR_HDR.size)
         if len(raw) != PAR_HDR.size:
             raise IntegrityError("parity file header is truncated")
-        magic, shard, k, m, covered, groups, _, crc = PAR_HDR.unpack(raw)
+        magic, shard, k, m, covered, groups, res, crc = PAR_HDR.unpack(raw)
         if magic != PARITY_MAGIC or zlib.crc32(raw[:-4]) & 0xFFFFFFFF != crc:
             raise IntegrityError("parity file header is damaged")
-        if not (shard and 0 < m and 0 < k and k + m <= 255 and groups == -(-covered // (k * shard))):
+        depth = struct.unpack_from("<H", res)[0] or 1
+        if not (shard and 0 < m and 0 < k and k + m <= 255 and depth <= 1024
+                and groups == -(-covered // (k * shard))):
             raise IntegrityError("parity file header is inconsistent")
-        return shard, k, m, covered
+        return shard, k, m, covered, depth
 
     @staticmethod
-    def _header(shard, k, m, covered):
+    def _header(shard, k, m, covered, depth):
         groups = -(-covered // (k * shard))
-        raw = PAR_HDR.pack(PARITY_MAGIC, shard, k, m, covered, groups, b"\0" * 32, 0)
+        res = struct.pack("<H", depth).ljust(32, b"\0")
+        raw = PAR_HDR.pack(PARITY_MAGIC, shard, k, m, covered, groups, res, 0)
         return raw[:-4] + struct.pack("<I", zlib.crc32(raw[:-4]) & 0xFFFFFFFF)
 
-    def _group_data(self, sf, g, k, shard, size):
-        """The K data shards of group g (zero-padded), and how many store bytes it holds."""
-        start = g * k * shard
-        n = max(0, min(k * shard, size - start))
-        sf.seek(start)
+    def params(self) -> dict | None:
+        """shard / k / m / depth of the existing sidecar (None: none or unreadable)."""
+        try:
+            with open(self.path, "rb") as f:
+                shard, k, m, _, depth = self._read_header(f)
+        except (OSError, IntegrityError):
+            return None
+        return {"shard": shard, "k": k, "m": m, "depth": depth}
+
+    @staticmethod
+    def _supers(size, shard, k, depth):
+        """(super-group number, first store byte, number of groups) for a store
+        of `size` bytes. Every super-group but the last has `depth` groups; the
+        last has just enough for its shards, so small stores pay no more."""
+        span = depth * k * shard
+        for sg in range(-(-size // span)):
+            base = sg * span
+            ng = depth if base + span <= size else -(-(-(-(size - base) // shard)) // k)
+            yield sg, base, ng
+
+    @staticmethod
+    def _super_data(sf, base, ng, k, shard, size):
+        """[k, ng, shard] array: [i, j] is data shard i of group j, i.e. store
+        shard i*ng + j of the super-group (zero-padded past the end)."""
+        n = max(0, min(k * ng * shard, size - base))
+        sf.seek(base)
         raw = sf.read(n)
-        buf = np.zeros(k * shard, dtype=np.uint8)
+        buf = np.zeros(k * ng * shard, dtype=np.uint8)
         buf[:len(raw)] = np.frombuffer(raw, dtype=np.uint8)
-        return [buf[i * shard:(i + 1) * shard] for i in range(k)], n
+        return buf.reshape(k, ng, shard)
+
+    @staticmethod
+    def _offsets(base, ng, j, k, shard):
+        return [base + (i * ng + j) * shard for i in range(k)]
+
+    @staticmethod
+    def _len(a, total, shard):
+        return max(0, min(shard, total - a))
 
     def _record(self, g, data, n, k, m, shard):
         C = _cauchy(k, m)
@@ -2007,61 +2261,74 @@ class Parity:
         par = [np.frombuffer(raw, dtype=np.uint8, count=shard, offset=o + j * shard) for j in range(m)]
         return n, hashes, par
 
+    def _write_supers(self, pf, sf, supers, k, m, shard, depth, size):
+        rs = self._rec_size(k, m, shard)
+        for sg, base, ng in supers:
+            arr = self._super_data(sf, base, ng, k, shard, size)
+            pf.seek(PAR_HDR.size + sg * depth * rs)
+            for j in range(ng):
+                offs = self._offsets(base, ng, j, k, shard)
+                n = sum(self._len(a, size, shard) for a in offs)
+                pf.write(self._record(sg * depth + j, [arr[i, j] for i in range(k)], n, k, m, shard))
+
     # ---- writing ----
     def exists(self) -> bool:
         return os.path.exists(self.path)
 
-    def build(self, shard=PARITY_SHARD, k=PARITY_K, m=PARITY_M) -> dict:
+    def build(self, shard=PARITY_SHARD, k=PARITY_K, m=PARITY_M, depth=PARITY_DEPTH) -> dict:
         """(Re)compute parity for the whole store into a new sidecar."""
+        if not (0 < m and 0 < k and k + m <= 255 and 1 <= depth <= 1024):
+            raise ValueError("parity: need 1 <= m, k + m <= 255, 1 <= depth <= 1024")
         tmp = self.path + "-new"
         size = os.path.getsize(self.store)
         with open(self.store, "rb") as sf, open(tmp, "wb") as pf:
-            pf.write(self._header(shard, k, m, size))
-            for g in range(-(-size // (k * shard))):
-                data, n = self._group_data(sf, g, k, shard, size)
-                pf.write(self._record(g, data, n, k, m, shard))
+            pf.write(self._header(shard, k, m, size, depth))
+            self._write_supers(pf, sf, self._supers(size, shard, k, depth), k, m, shard, depth, size)
             pf.flush()
             os.fsync(pf.fileno())
         os.replace(tmp, self.path)
-        return {"covered": size, "bytes": os.path.getsize(self.path)}
+        return {"covered": size, "bytes": os.path.getsize(self.path), "m": m, "depth": depth}
 
     def update(self, from_offset: int) -> dict:
         """After an append (or truncation) at from_offset: recompute only the
-        groups from the one holding from_offset to the end. The bytes of that
-        first group before from_offset are checked against their recorded
+        super-groups from the one holding from_offset to the end. The bytes of
+        that super-group before from_offset are checked against their recorded
         hashes first, so damage in old data is never baked into new parity."""
         size = os.path.getsize(self.store)
         with open(self.path, "r+b") as pf, open(self.store, "rb") as sf:
-            shard, k, m, covered = self._read_header(pf)
+            shard, k, m, covered, depth = self._read_header(pf)
             rs = self._rec_size(k, m, shard)
-            g0 = min(from_offset, covered) // (k * shard)
-            if g0 * k * shard < min(from_offset, covered):
-                pf.seek(PAR_HDR.size + g0 * rs)
-                rec = self._parse_record(pf.read(rs), g0, k, m, shard)
-                data, _ = self._group_data(sf, g0, k, shard, size)
-                keep = min(from_offset, covered) - g0 * k * shard
-                for i in range(-(-keep // shard)):
-                    a = i * shard
-                    if a + shard <= keep:
-                        old = data[i].tobytes()
-                    elif rec is not None and keep == rec[0]:     # pure append: old tail shard was zero-padded
-                        old = data[i][:keep - a].tobytes() + b"\0" * (shard - (keep - a))
-                    else:
-                        continue                                 # bytes after the cut changed legitimately
-                    if rec is None or _shard_hash(old) != rec[1][i]:
-                        raise IntegrityError(f"stored bytes before offset {from_offset:,} do not match their "
-                                             f"parity record; run `repair` (parity was not updated)")
+            keep = min(from_offset, covered)
+            sg0 = keep // (depth * k * shard)
+            old = list(self._supers(covered, shard, k, depth))
+            if sg0 < len(old) and old[sg0][1] < keep:
+                _, base, ng = old[sg0]
+                arr = self._super_data(sf, base, ng, k, shard, size)
+                for j in range(ng):
+                    g = sg0 * depth + j
+                    pf.seek(PAR_HDR.size + g * rs)
+                    rec = self._parse_record(pf.read(rs), g, k, m, shard)
+                    for i, a in enumerate(self._offsets(base, ng, j, k, shard)):
+                        if a >= keep:
+                            continue
+                        if a + shard <= keep:
+                            cur = arr[i, j].tobytes()
+                        elif keep == covered:              # pure append: the old tail shard was zero-padded
+                            cur = arr[i, j][:keep - a].tobytes() + b"\0" * (shard - (keep - a))
+                        else:
+                            continue                       # bytes after the cut changed legitimately
+                        if rec is None or _shard_hash(cur) != rec[1][i]:
+                            raise IntegrityError(f"stored bytes before offset {from_offset:,} do not match their "
+                                                 f"parity record; run `repair` (parity was not updated)")
+            new = list(self._supers(size, shard, k, depth))
+            self._write_supers(pf, sf, new[sg0:], k, m, shard, depth, size)
             groups = -(-size // (k * shard))
-            for g in range(g0, groups):
-                data, n = self._group_data(sf, g, k, shard, size)
-                pf.seek(PAR_HDR.size + g * rs)
-                pf.write(self._record(g, data, n, k, m, shard))
             pf.truncate(PAR_HDR.size + groups * rs)
             pf.seek(0)
-            pf.write(self._header(shard, k, m, size))
+            pf.write(self._header(shard, k, m, size, depth))
             pf.flush()
             os.fsync(pf.fileno())
-        return {"covered": size, "groups_written": groups - g0}
+        return {"covered": size, "supers_written": len(new) - sg0}
 
     # ---- checking / repairing ----
     def check(self, fix: bool = False) -> dict:
@@ -2077,53 +2344,56 @@ class Parity:
             return res
         with pf, open(self.store, "r+b" if fix else "rb") as sf:
             try:
-                shard, k, m, covered = self._read_header(pf)
+                shard, k, m, covered, depth = self._read_header(pf)
             except IntegrityError as e:
                 res["header_ok"] = False
                 res["error"] = str(e)
                 return res
-            res.update(covered=covered, groups=-(-covered // (k * shard)))
+            res.update(covered=covered, groups=-(-covered // (k * shard)), m=m, depth=depth)
             rs, C = self._rec_size(k, m, shard), _cauchy(k, m)
             size = res["size"]
-            for g in range(res["groups"]):
-                rec = self._parse_record(pf.read(rs), g, k, m, shard)
-                if rec is None:
-                    res["bad_records"].append(g)
-                    continue
-                n, hashes, par = rec
-                data, have = self._group_data(sf, g, k, shard, min(size, g * k * shard + n))
-                bad = [i for i in range(k) if _shard_hash(data[i]) != hashes[i]]
-                if have < n:                                 # store shorter than recorded
-                    bad = sorted(set(bad) | set(range(have // shard, -(-n // shard))))
-                if not bad:
-                    continue
-                res["bad_shards"] += len(bad)
-                good_par = [j for j in range(m) if _shard_hash(par[j]) == hashes[k + j]]
-                if len(bad) > len(good_par):
-                    res["unrepairable_groups"].append(g)
-                    continue
-                # Solve for the bad data shards from the good ones + enough good parity.
-                use = good_par[:len(bad)]
-                rows, vecs = [], []
-                for i in range(k):
-                    if i not in bad:
-                        rows.append([int(t == i) for t in range(k)])
-                        vecs.append(data[i])
-                for j in use:
-                    rows.append(C[j])
-                    vecs.append(par[j])
-                inv = _gf_invert(rows)
-                fixed = {i: _gf_combine(inv[i], vecs) for i in bad}
-                if any(_shard_hash(fixed[i]) != hashes[i] for i in bad):
-                    res["unrepairable_groups"].append(g)       # parity does not belong to this data
-                    continue
-                if fix:
-                    for i in bad:
-                        a = g * k * shard + i * shard
-                        ln = min(shard, n - i * shard)
-                        sf.seek(a)
-                        sf.write(fixed[i][:ln].tobytes())
-                    res["repaired_shards"] += len(bad)
+            for sg, base, ng in self._supers(covered, shard, k, depth):
+                arr = self._super_data(sf, base, ng, k, shard, size)
+                pf.seek(PAR_HDR.size + sg * depth * rs)
+                for j in range(ng):
+                    g = sg * depth + j
+                    rec = self._parse_record(pf.read(rs), g, k, m, shard)
+                    if rec is None:
+                        res["bad_records"].append(g)
+                        continue
+                    _, hashes, par = rec
+                    data = [arr[i, j] for i in range(k)]
+                    offs = self._offsets(base, ng, j, k, shard)
+                    bad = [i for i in range(k) if _shard_hash(data[i]) != hashes[i]
+                           or self._len(offs[i], size, shard) < self._len(offs[i], covered, shard)]
+                    if not bad:
+                        continue
+                    res["bad_shards"] += len(bad)
+                    good_par = [t for t in range(m) if _shard_hash(par[t]) == hashes[k + t]]
+                    if len(bad) > len(good_par):
+                        res["unrepairable_groups"].append(g)
+                        continue
+                    # Solve for the bad data shards from the good ones + enough good parity.
+                    rows, vecs = [], []
+                    for i in range(k):
+                        if i not in bad:
+                            rows.append([int(t == i) for t in range(k)])
+                            vecs.append(data[i])
+                    for t in good_par[:len(bad)]:
+                        rows.append(C[t])
+                        vecs.append(par[t])
+                    inv = _gf_invert(rows)
+                    fixed = {i: _gf_combine(inv[i], vecs) for i in bad}
+                    if any(_shard_hash(fixed[i]) != hashes[i] for i in bad):
+                        res["unrepairable_groups"].append(g)       # parity does not belong to this data
+                        continue
+                    if fix:
+                        for i in bad:
+                            ln = self._len(offs[i], covered, shard)
+                            if ln:
+                                sf.seek(offs[i])
+                                sf.write(fixed[i][:ln].tobytes())
+                        res["repaired_shards"] += len(bad)
             if fix and res["repaired_shards"]:
                 sf.flush()
                 os.fsync(sf.fileno())
@@ -2146,7 +2416,7 @@ def parity_summary(c: dict) -> str:
     return "; ".join(parts)
 
 
-def repair(path: str) -> list[str]:
+def repair(path: str, dry_run: bool = False) -> list[str]:
     """Fix what can be fixed without losing anything, under the store lock:
 
     * the newest snapshot is complete but its footer is damaged or was never
@@ -2159,6 +2429,8 @@ def repair(path: str) -> list[str]:
     Damaged packs or manifests cannot be repaired here: `verify` lists them,
     and `prune --remove` can rebuild the store without damaged snapshots.
     Returns a description of each change made (empty: nothing to do)."""
+    if dry_run:
+        return _repair_plan(path)
     lock = _StoreLock(path)
     try:
         done = []
@@ -2178,11 +2450,36 @@ def repair(path: str) -> list[str]:
                 with StoreReader(path) as r:
                     clean = not r.scan()["problems"]
                 if clean:
-                    par.build()
+                    par.build(**(par.params() or {}))
                     done.append("rebuilt the parity file from the verified store")
         return done
     finally:
         lock.release()
+
+
+def _repair_plan(path: str) -> list[str]:
+    """What repair would do; changes nothing."""
+    plan = []
+    par = Parity(path)
+    if par.exists():
+        c = par.check()
+        if c["bad_shards"]:
+            plan.append(f"would rebuild damaged {PARITY_SHARD >> 10} KiB shard(s) from parity "
+                        f"({c['bad_shards']} found; {len(c['unrepairable_groups'])} group(s) beyond repair)")
+        if not c["header_ok"] or c["bad_records"] or c["covered"] != c["size"]:
+            plan.append("would rebuild the parity file if the store then verifies")
+    try:
+        with StoreReader(path) as r:
+            for s in r.snapshots[:-1]:
+                if r._read(s.block_end, FOOTER.size) != FOOTER.pack(s.offset, STORE_MAGIC):
+                    plan.append(f"would rewrite the damaged footer at byte {s.block_end:,}")
+            if r.tail_snapshot is not None:
+                plan.append("would write the missing/damaged footer of the newest snapshot")
+            elif r.end != r.file_size:
+                plan.append(f"would cut off {r.file_size - r.end:,} trailing bytes that hold no snapshot")
+    except IntegrityError as e:
+        plan.append(f"the store does not open yet ({e}); parity repair runs first")
+    return plan
 
 
 def _repair_footers(path: str) -> list[str]:
@@ -2196,22 +2493,51 @@ def _repair_footers(path: str) -> list[str]:
                 fix.append((s.block_end, s.offset))
     if not fix and end == size:
         return done
+    with open(path, "r+b") as f:
+        for pos, moff in fix:
+            f.seek(pos)
+            f.write(FOOTER.pack(moff, STORE_MAGIC))
+            done.append(f"rewrote the damaged footer at byte {pos:,}")
+        if tail is not None:
+            f.truncate(tail[1])
+            f.seek(tail[1])
+            f.write(FOOTER.pack(tail[0], STORE_MAGIC))
+            done.append("wrote the missing/damaged footer of the newest snapshot, which is visible again")
+        elif end != size:
+            f.truncate(end)
+            done.append(f"cut off {size - end:,} bytes of an interrupted write (they held no snapshot)")
+        f.flush()
+        os.fsync(f.fileno())
+    return done
+
+
+def change_password(path: str, old: str | None, new: str) -> None:
+    """Seal the store's data key under a new password (the data is not
+    re-encrypted). Copies of the store made before still open with the old
+    password. Refuses if the parity check finds damage."""
+    lock = _StoreLock(path)
+    try:
+        with StoreReader(path, password=old) as r:
+            if not r.encrypted:
+                raise IntegrityError(f"{path} is not encrypted")
+            key, kb = _KEYS[hashlib.sha256(r.key_block[HDR.size:]).digest()], r.key_block
+        par = Parity(path)
+        if par.exists():
+            c = par.check()
+            if c["bad_shards"] or c["bad_records"] or not c["header_ok"]:
+                raise IntegrityError("the parity check found damage; run `repair` first")
+        block, _ = make_key_block(new, key)
+        assert len(block) == len(kb)
         with open(path, "r+b") as f:
-            for pos, moff in fix:
-                f.seek(pos)
-                f.write(FOOTER.pack(moff, STORE_MAGIC))
-                done.append(f"rewrote the damaged footer at byte {pos:,}")
-            if tail is not None:
-                f.truncate(tail[1])
-                f.seek(tail[1])
-                f.write(FOOTER.pack(tail[0], STORE_MAGIC))
-                done.append("wrote the missing/damaged footer of the newest snapshot, which is visible again")
-            elif end != size:
-                f.truncate(end)
-                done.append(f"cut off {size - end:,} bytes of an interrupted write (they held no snapshot)")
+            f.seek(len(STORE_MAGIC))
+            f.write(block)
             f.flush()
             os.fsync(f.fileno())
-        return done
+        _KEYS.pop(hashlib.sha256(kb[HDR.size:]).digest(), None)
+        if par.exists():
+            par.build(**(par.params() or {}))
+    finally:
+        lock.release()
 
 
 # --------------------------------------------------------------------------
@@ -2339,16 +2665,19 @@ def prune(path: str, remove, repack_below: float = 0.5, level: int = 19, dry_run
                 return ps
 
             codec = BlockCodec(zstd_level=level)
+            codec.cipher = r.codec.cipher            # same key: copied packs stay readable
             nw = max(1, workers if workers is not None else min(os.cpu_count() or 1, 16))
             pool = ThreadPoolExecutor(nw, thread_name_prefix="hcs-prune") if nw > 1 else None
             f = open(out, "wb")
             try:
                 f.write(STORE_MAGIC)
                 pos = len(STORE_MAGIC)
+                if r.encrypted:
+                    f.write(r.key_block); pos += len(r.key_block)
                 if r.has_dict:
-                    blk = raw_block(len(STORE_MAGIC))
+                    blk = raw_block(r.dict_off)
                     f.write(blk); pos += len(blk)
-                    codec.set_dictionary(r._block(len(STORE_MAGIC))[0])
+                    codec.set_dictionary(r._block(r.dict_off)[0])
                 new_offsets: list[int] = []
                 remap: dict[int, int] = {}
                 prev = 0
@@ -2430,7 +2759,7 @@ def prune(path: str, remove, repack_below: float = 0.5, level: int = 19, dry_run
             r2.verify()
         had_parity = Parity(path).exists()
         if had_parity:
-            Parity(out).build()
+            Parity(out).build(**(Parity(path).params() or {}))
         os.replace(out, path)
         if had_parity:
             os.replace(out + ".hcp", path + ".hcp")
@@ -2463,13 +2792,15 @@ def _fmt(st: Stats) -> str:
 
 
 def _write(store: str, src: str, append: bool, level: int = 19, workers: int | None = None,
-           rehash: bool = False, parity: bool | None = None, pack_mb: float = 1) -> int:
+           rehash: bool = False, parity: bool | None = None, pack_mb: float = 1,
+           encrypt: bool = False, cloud_files: bool = False) -> int:
     if not os.path.isdir(src):
         print(f"error: {src} is not a directory", file=sys.stderr)
         return 2
     t0 = time.time()
     w = StoreWriter(store, codec=BlockCodec(zstd_level=level), append=append, workers=workers, parity=parity,
-                    pack_target=max(1 << 16, int(pack_mb * (1 << 20))))
+                    pack_target=max(1 << 16, int(pack_mb * (1 << 20))), encrypt=encrypt,
+                    cloud_files=cloud_files)
     if w.recovered_bytes:
         print(f"note: discarded {w.recovered_bytes:,} bytes left by an interrupted earlier run",
               file=sys.stderr)
@@ -2570,9 +2901,21 @@ def main(argv) -> int:
     ap = argparse.ArgumentParser(prog="hybridstore", description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--password-file", metavar="FILE", default=None,
+                        help=f"password of an encrypted store (first line of FILE); else the {PASSWORD_ENV} "
+                             f"environment variable, else a prompt")
+    _add = sub.add_parser
+    sub.add_parser = lambda *x, **kw: _add(*x, parents=[common], **kw)
     for name, hlp in (("pack", "pack a directory into a NEW store (overwrites)"),
                       ("backup", "add a snapshot of a directory (creates the store if missing)")):
         p = sub.add_parser(name, help=hlp)
+        p.add_argument("--cloud-files", action="store_true",
+                       help="also read OneDrive / cloud placeholder files (downloads them); default: skip "
+                            "and report them")
+        p.add_argument("--encrypt", action="store_true",
+                       help="new store only: seal everything with ChaCha20-Poly1305 under a password "
+                            "(scrypt). Appending to an encrypted store needs the password, nothing else")
         p.add_argument("input_dir"); p.add_argument("store")
         p.add_argument("--level", type=int, default=19,
                        help="zstd level 1-22 (default 19; 9 is ~15x faster for ~10%% less ratio)")
@@ -2601,9 +2944,19 @@ def main(argv) -> int:
                    help="make every restored file durable before renaming it into place (slower)")
     p = sub.add_parser("repair", help="rebuild damaged bytes from parity, fix footers (loses nothing)")
     p.add_argument("store")
+    p.add_argument("--dry-run", action="store_true", help="only say what would be repaired")
     p = sub.add_parser("parity", help="add or refresh Reed-Solomon recovery data (<store>.hcp)")
     p.add_argument("store")
     p.add_argument("--remove", action="store_true", help="delete the recovery data instead")
+    p.add_argument("--m", type=int, default=None, metavar="M",
+                   help=f"parity shards per {PARITY_K} data shards (default: keep the current, else "
+                        f"{PARITY_M} = 12.5%%; 4 = 25%%, survives 4 MiB bursts per 16 MiB)")
+    p.add_argument("--depth", type=int, default=None, metavar="D",
+                   help=f"interleaving depth (default {PARITY_DEPTH}; 1 = the original layout)")
+    p = sub.add_parser("passwd", help="change the password of an encrypted store")
+    p.add_argument("store")
+    p.add_argument("--new-password-file", metavar="FILE", default=None,
+                   help="new password (first line of FILE); default: prompt twice")
     p = sub.add_parser("prune", help="delete snapshots and reclaim their space (by number and/or policy)")
     p.add_argument("store")
     p.add_argument("--remove", type=int, nargs="+", default=[], metavar="N",
@@ -2623,8 +2976,39 @@ def main(argv) -> int:
     p.add_argument("--allow-partial", action="store_true",
                    help="do not fail on bytes left by an interrupted write / a cut-short store")
     a = ap.parse_args(argv)
+    global _prompt_ok
+    saved = (_prompt_ok, _password)
+    _prompt_ok = True
+    try:
+        return _main(a)
+    finally:            # main() may be called in-process (tests, other tools): leave no state behind
+        _prompt_ok = saved[0]
+        set_password(saved[1])
+
+
+def _main(a) -> int:
+    if a.password_file:
+        with open(a.password_file, encoding="utf-8") as fh:
+            set_password(fh.readline().rstrip("\r\n"))
 
     try:
+        if a.cmd == "passwd":
+            if a.new_password_file:
+                with open(a.new_password_file, encoding="utf-8") as fh:
+                    new = fh.readline().rstrip("\r\n")
+            else:
+                import getpass
+                if not (sys.stdin and sys.stdin.isatty()):
+                    print("error: give --new-password-file (no terminal to prompt on)", file=sys.stderr)
+                    return 2
+                new = getpass.getpass("new password: ")
+                if getpass.getpass("repeat the new password: ") != new:
+                    print("error: the two passwords differ", file=sys.stderr)
+                    return 2
+            change_password(a.store, None, new)
+            print("password changed (the data key is unchanged; older copies of the store still open with "
+                  "the old password)")
+            return 0
         if a.cmd == "pack":
             if not a.force and os.path.exists(a.store) and os.path.getsize(a.store) > 0:
                 try:
@@ -2636,10 +3020,12 @@ def main(argv) -> int:
                       f"snapshot, or `pack --force` to replace it", file=sys.stderr)
                 return 2
             return _write(a.store, a.input_dir, append=False, level=a.level, workers=a.workers,
-                          parity=False if a.no_parity else None, pack_mb=a.pack_mb)
+                          parity=False if a.no_parity else None, pack_mb=a.pack_mb, encrypt=a.encrypt,
+                          cloud_files=a.cloud_files)
         if a.cmd == "backup":
             return _write(a.store, a.input_dir, append=True, level=a.level, workers=a.workers,
-                          rehash=a.rehash, pack_mb=a.pack_mb)
+                          rehash=a.rehash, pack_mb=a.pack_mb, encrypt=a.encrypt,
+                          cloud_files=a.cloud_files)
         if a.cmd == "prune":
             return _prune_cli(a)
         if a.cmd == "parity":
@@ -2656,12 +3042,24 @@ def main(argv) -> int:
                         print("error: the store has damage; parity is only built over a verified store "
                               "(run `verify` / `repair` first)", file=sys.stderr)
                         return 1
-                info = par.build()
+                opts = par.params() or {}
+                if a.m is not None:
+                    opts["m"] = a.m
+                if a.depth is not None:
+                    opts["depth"] = a.depth
+                info = par.build(**opts)
                 print(f"parity written: {par.path}, {info['bytes']:,} bytes for {info['covered']:,} store bytes "
-                      f"({100 * info['bytes'] / max(info['covered'], 1):.1f}%)")
+                      f"({100 * info['bytes'] / max(info['covered'], 1):.1f}%; m={info['m']}, "
+                      f"interleave depth {info['depth']})")
                 return 0
             finally:
                 lock.release()
+        if a.cmd == "repair" and a.dry_run:
+            plan = repair(a.store, dry_run=True)
+            for d in plan:
+                print(d)
+            print("nothing to repair" if not plan else "(dry run: nothing was changed)")
+            return 0
         if a.cmd == "repair":
             done = repair(a.store)
             for d in done:
@@ -2699,6 +3097,9 @@ def main(argv) -> int:
     except StoreLockedError as e:
         print(f"error: {e}", file=sys.stderr)
         return 4
+    except PasswordError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 5
     except (IntegrityError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
