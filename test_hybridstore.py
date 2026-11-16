@@ -753,6 +753,126 @@ def _():
         assert {e.path: r.read_file(e) for e in r.snapshots[0].files} == copies[1]
 
 
+# ---------------------------------------------------------------- Reed-Solomon parity
+
+def _par_store(name, snaps=3):
+    src = os.path.join(TMP, name)
+    store = os.path.join(TMP, name + ".hcs")
+    for k in range(snaps):
+        tree(src, {f"f{i}.bin": text(400_000, 3000 + 100 * k + i) for i in range(4)})
+        tree(src, {f"r{k}.bin": os.urandom(300_000)})
+        w = hs.StoreWriter(store, append=True, parity=True); w.add_tree(src); w.close()
+    return src, store
+
+
+@check("parity: incremental updates after each backup equal a full rebuild; prune keeps it consistent")
+def _():
+    src, store = _par_store("par_inc")
+    inc = open(store + ".hcp", "rb").read()
+    hs.Parity(store).build()
+    assert open(store + ".hcp", "rb").read() == inc
+    c = hs.Parity(store).check()
+    assert c["covered"] == c["size"] == os.path.getsize(store) and not c["bad_shards"] and not c["bad_records"]
+    hs.prune(store, [2])
+    c = hs.Parity(store).check()
+    assert c["covered"] == os.path.getsize(store) and not c["bad_shards"] and not c["bad_records"], c
+    assert not os.path.exists(store + ".hcs-new.hcp")
+
+
+@check("parity: damage anywhere (packs, manifests, footers, header) is rebuilt bit-exact by repair")
+def _():
+    src, store = _par_store("par_fix")
+    good = open(store, "rb").read()
+    with hs.StoreReader(store) as r:
+        hot = [8, len(good) - 3] + [s.offset + 20 for s in r.snapshots] + [s.block_end + 9 for s in r.snapshots]
+    rng = random.Random(11)
+    spots = hot + [rng.randrange(len(good)) for _ in range(25)]
+    for i in spots:
+        b = bytearray(good); b[i] ^= 1 << rng.randrange(8); open(store, "wb").write(b)
+        done = hs.repair(store)
+        assert open(store, "rb").read() == good, (i, done)
+    # several shards at once, in different groups (2 per group is the limit)
+    b = bytearray(good)
+    for o in (70_000, 140_000, 1_200_000):
+        b[o:o + 5000] = os.urandom(5000)
+    open(store, "wb").write(b)
+    hs.repair(store)
+    assert open(store, "rb").read() == good
+    with hs.StoreReader(store) as r:
+        assert r.verify() > 0
+
+
+@check("parity: damage beyond its capacity is refused and nothing is written; stale parity never writes")
+def _():
+    src, store = _par_store("par_lim")
+    good = open(store, "rb").read()
+    b = bytearray(good); b[100_000:100_000 + 200_000] = os.urandom(200_000)   # 4 shards of one group
+    open(store, "wb").write(b)
+    done = hs.repair(store)
+    assert open(store, "rb").read() == bytes(b), "repair wrote bytes it could not prove"
+    assert any("could NOT" in d for d in done), done
+    code, out = _quiet("verify", store)
+    assert code == 1 and "beyond repair" in out, out
+    # parity left over from a different store: every check fails its hash, nothing is written
+    open(store, "wb").write(good)
+    other_src, other = _par_store("par_other", snaps=1)
+    os.replace(other + ".hcp", store + ".hcp")
+    c = hs.Parity(store).check(fix=True)
+    assert c["repaired_shards"] == 0 and open(store, "rb").read() == good
+    done = hs.repair(store)                       # store verifies, so the parity is rebuilt for it
+    assert "rebuilt the parity file from the verified store" in done, done
+    c = hs.Parity(store).check()
+    assert not c["bad_shards"] and c["covered"] == len(good)
+
+
+@check("parity: a damaged parity file is reported and rebuilt; old damage is never baked into new parity")
+def _():
+    src, store = _par_store("par_side")
+    _flip(store + ".hcp", 200)                     # inside the first record's hashes
+    c = hs.Parity(store).check()
+    assert c["bad_records"] == [0], c
+    code, out = _quiet("verify", store)
+    assert code == 0 and "parity record(s) damaged" in out, out
+    assert "rebuilt the parity file from the verified store" in hs.repair(store)
+    assert not hs.Parity(store).check()["bad_records"]
+    # Damage the last (partial) group, then back up: the update must refuse rather than
+    # recompute parity over the damaged bytes; repair afterwards still restores them.
+    good = open(store, "rb").read()
+    _flip(store, len(good) - 40_000)
+    tree(src, {"later.bin": os.urandom(100_000)})
+    w = hs.StoreWriter(store, append=True); w.add_tree(src); st = w.close()
+    assert st.parity.startswith("warning") and "repair" in st.parity, st.parity
+    hs.repair(store)
+    assert open(store, "rb").read()[:len(good)] == good
+    with hs.StoreReader(store) as r:
+        assert len(r.snapshots) == 4 and r.verify() > 0
+    c = hs.Parity(store).check()
+    assert c["covered"] == os.path.getsize(store) and not c["bad_shards"], c
+
+
+@check("parity: on by default for new stores; --no-parity and `parity --remove` turn it off")
+def _():
+    src = os.path.join(TMP, "par_cli"); tree(src, {"a.txt": text(100_000, 1)})
+    store = os.path.join(TMP, "par_cli.hcs")
+    assert _quiet("pack", src, store)[0] == 0 and os.path.exists(store + ".hcp")
+    assert _quiet("pack", src, store, "--force", "--no-parity")[0] == 0 and not os.path.exists(store + ".hcp")
+    assert _quiet("parity", store)[0] == 0 and os.path.exists(store + ".hcp")
+    assert _quiet("backup", src, store)[0] == 0 and not hs.Parity(store).check()["bad_shards"]
+    assert _quiet("parity", store, "--remove")[0] == 0 and not os.path.exists(store + ".hcp")
+
+
+@check("--pack-mb sets the pack size; unpack --fsync restores bit-exact")
+def _():
+    src = os.path.join(TMP, "opts"); tree(src, {f"t{i}.txt": text(900_000, 50 + i) for i in range(6)})
+    small, big = os.path.join(TMP, "opts1.hcs"), os.path.join(TMP, "opts4.hcs")
+    assert _quiet("pack", src, small)[0] == 0 and _quiet("pack", src, big, "--pack-mb", "4")[0] == 0
+    with hs.StoreReader(small) as a, hs.StoreReader(big) as b:
+        assert len(b.pack_offsets) < len(a.pack_offsets)
+    out = os.path.join(TMP, "opts_out")
+    assert _quiet("unpack", big, out, "--fsync")[0] == 0
+    same_tree(src, out)
+
+
 if __name__ == "__main__":
     shutil.rmtree(TMP, ignore_errors=True)
     print(f"\nall {len(passed)} checks passed")

@@ -17,7 +17,7 @@ It lists five Phase I bugs and Phase II fixes: a naive XOR boundary test (fix: a
 | `hybridstore.py` | The engine and CLI (commands below) |
 | `bench.py` | Builds the sample datasets, checks round trips, runs an incremental-backup run and the corruption test, compares against baselines |
 | `bench_large.py` | Packs, verifies and restores one large file (default 2 GiB) and reports peak memory |
-| `test_hybridstore.py` | 26 checks: streaming, snapshots, v1 compatibility, crash recovery, path safety, large media, locking, skipped files, strict verify, decompression bombs, metadata, unchanged-file reuse, prune (copy/repack/dictionary, policies, dry run, refusals), and the safeguards (damaged footers and manifests, `pack`/`unpack` refusals, files changing while read, full damage reports) |
+| `test_hybridstore.py` | 32 checks: streaming, snapshots, v1 compatibility, crash recovery, path safety, large media, locking, skipped files, strict verify, decompression bombs, metadata, unchanged-file reuse, prune (copy/repack/dictionary, policies, dry run, refusals), and the safeguards (damaged footers and manifests, `pack`/`unpack` refusals, files changing while read, full damage reports), Reed-Solomon parity (incremental = full rebuild, bit-exact repair of packs/manifests/footers/header, refusal beyond capacity, stale or damaged sidecar), `--pack-mb` / `--fsync` |
 | `FORMAT.md` | Byte-level specification of the store format |
 | `hybridstore.cmd` | Windows launcher that uses the local `.venv` |
 | `hybridstore_mcp.py` | Read-only MCP server: lets an LLM list, read, search and diff snapshots without unpacking (see below) |
@@ -69,7 +69,32 @@ A review damaged a scratch store on purpose. Detection was already complete, but
 | Damage found by `verify` | stopped at the first error | lists every damaged pack and every affected file in every snapshot, and which snapshots are fully intact |
 | A damaged older footer | `verify` failed with no fix | `repair` rewrites it in place |
 
-`repair` only writes footers (16 bytes each) and cuts off bytes that hold no complete snapshot; it never touches data blocks. Damaged packs cannot be repaired: each holds the only copy of its chunks (deduplication keeps one copy), so one bad byte loses every file with data in that pack, in every snapshot that uses it. Protect against that with a second copy of the store on another disk, or parity data (planned: Reed-Solomon), and run `verify` on a schedule.
+Deduplication keeps one copy of each chunk, so without parity one bad byte loses every file with data in that 1 MiB pack, in every snapshot that uses it. That is what the parity sidecar below is for.
+
+### Reed-Solomon parity (`<store>.hcp`)
+
+New stores get recovery data by default, in a sidecar file next to the store (`pack --no-parity` to skip it, `parity <store>` to add it to an existing store, `parity <store> --remove` to drop it). `backup` keeps it up to date incrementally and `prune` rebuilds it for the new store.
+
+```
+python hybridstore.py verify <store>     # also reports parity coverage and damaged shards
+python hybridstore.py repair <store>     # rebuilds damaged bytes from parity, then fixes footers
+python hybridstore.py parity <store>     # add / refresh parity for an existing (verified) store
+```
+
+* **What it covers:** every byte of the store, including manifests, footers and the dictionary, cut into 64 KiB shards; each 1 MiB group of 16 shards gets 2 parity shards (12.5% of the store; small stores pay a little more for the last partial group).
+* **What it repairs:** any 2 damaged shards per group, data or parity, i.e. bit flips, bad sectors, and bursts up to 128 KiB per MiB. More than that is reported as beyond repair and nothing is written.
+* **Why it is safe:** each shard's BLAKE2b is recorded, so damage is located exactly, and a rebuilt shard is written only if it hashes to the recorded value. Parity can never "repair" the store into something else, even if it is stale or belongs to another store. A backup refuses to compute new parity over old damage.
+* **Measured** (`bench_integrity.py`, same corpora and seed as the RDC comparison; Windows, 3090 PC, 2026-11-16):
+
+| corpus | input | store | ratio | parity | ratio with parity | vs `zstd -19 --long` | 200 random bit flips (store + sidecar) |
+|---|---|---|---|---|---|---|---|
+| code | 11.8 MB | 2.24 MB | 5.25x | +17.6% | 4.46x | +12.1% | 200 repaired bit-exact, 0 refused, 0 silently wrong |
+| backups | 35.3 MB | 2.31 MB | 15.29x | +17.1% | 13.07x | +14.1% | 200 repaired bit-exact, 0 refused, 0 silently wrong |
+| mixed | 11.2 MB | 5.69 MB | 1.97x | +13.9% | 1.73x | +0.7% | 200 repaired bit-exact, 0 refused, 0 silently wrong |
+
+  The RDC report's RS(12,10) repaired 193/200 at about 19% overhead and does not cover its manifest. Parity here is 12.5% per full 1 MiB group; these small stores pay more for the partial last group. Restores of many small files run at 5-9 MB/s on Windows (file creation dominates; 246 MB/s on the mixed corpus); `--fsync` costs a lot on Windows (0.4 MB/s on the small-file corpora), so it stays opt-in.
+
+Other options from the same review: `pack/backup --pack-mb 4` uses 4 MB solid packs, about 5% smaller on text (12% → 6% behind `zstd -19 --long` on the code corpus) at about 3x slower first reads of a file (2 → 7 ms); `unpack --fsync` makes each restored file durable before it is renamed into place.
 
 ### Hardening (Phase 1)
 
@@ -297,7 +322,6 @@ Next in Phase 2:
 * Encryption (AES-GCM or ChaCha20-Poly1305 with Argon2id).
 * An on-disk dedup index, so the index no longer takes about 17 GB of RAM per TB of unique data.
 * Read manifests lazily.
-* Reed-Solomon parity.
 * Windows VSS.
 
 Beyond that: use zstd's own long-distance matching inside packs, delta-compress similar chunks (find them by sketch or resemblance), add refcounts/GC so old snapshots can be deleted (the index is now persisted, see v2 notes), move dedup lookups and manifest building off the single writer thread for folders with many small files, and add a lossless JPEG recompressor (for example, a Brunsli/JPEG XL-style transcode) instead of a lossy neural codec.

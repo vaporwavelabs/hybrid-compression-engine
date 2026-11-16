@@ -648,6 +648,7 @@ class Stats:
     reused_bytes: int = 0
     skipped: list = field(default_factory=list)   # (path, reason) of files that could not be read
     changed: list = field(default_factory=list)   # paths still changing after a re-read (stored anyway)
+    parity: str = ""            # "built" / "updated" / "" (none) / "warning: ..."
 
 
 def _encode_pack(chunks: list[bytes]) -> bytes:
@@ -757,7 +758,7 @@ class StoreWriter:
     def __init__(self, path: str, chunker: FastCDC | None = None, codec: BlockCodec | None = None,
                  pack_target: int = 1 << 20, near_dup_hamming: int = 6,
                  append: bool = False, label: str = "", workers: int | None = None,
-                 max_pending_bytes: int = 256 << 20):
+                 max_pending_bytes: int = 256 << 20, parity: bool | None = None):
         """workers: threads for reading/chunking small files, hashing large
         ones and compressing packs (default: CPU count, max 16; 1 = no
         threads). Output is byte-identical whatever the worker count, except
@@ -766,7 +767,13 @@ class StoreWriter:
         Holds an exclusive lock on '<path>.lock' until close()/abort(); a
         second writer gets StoreLockedError instead of silently losing a
         snapshot. A new store (append=False or no store yet) is written to
-        '<path>.hcs-new' and only replaces <path> when close() succeeds."""
+        '<path>.hcs-new' and only replaces <path> when close() succeeds.
+
+        parity: None (default) = a new store gets a Reed-Solomon sidecar
+        '<path>.hcp' and an existing sidecar is kept up to date; True = also
+        create one for an existing store that has none; False = no parity
+        (a new store's stale sidecar is removed)."""
+        self.parity_mode = parity
         self.lock = _StoreLock(path)
         try:
             self._init(path, chunker, codec, pack_target, near_dup_hamming, append, label,
@@ -1255,11 +1262,34 @@ class StoreWriter:
             except OSError as e:
                 raise OSError(e.errno, f"could not replace {self.path} ({e.strerror}); "
                                        f"the new store is complete at {self.path}.hcs-new") from e
+        self.stats.parity = self._update_parity()
         self.lock.release()
         self.stats.manifest_bytes = len(block)
         self.stats.store_bytes = self.pos
         self.stats.added_bytes = self.pos - self.start + (len(STORE_MAGIC) if self.created else 0)
         return self.stats
+
+    def _update_parity(self) -> str:
+        """Bring the parity sidecar up to date (under the store lock). A
+        failure here never fails the backup: the snapshot is already safe."""
+        par = Parity(self.path)
+        try:
+            if self.created:
+                if self.parity_mode is False:
+                    if par.exists():
+                        os.remove(par.path)          # it belonged to the store just replaced
+                    return ""
+                par.build()
+                return "built"
+            if par.exists() and self.parity_mode is not False:
+                par.update(self.start)
+                return "updated"
+            if self.parity_mode:
+                par.build()
+                return "built"
+            return ""
+        except (OSError, IntegrityError) as e:
+            return f"warning: parity not updated ({e})"
 
     def abort(self):
         """Discard everything written by this run (a new store's temp file
@@ -1607,7 +1637,8 @@ class StoreReader:
     def read_file(self, e: FileEntry) -> bytes:
         return b"".join(self.iter_file(e))
 
-    def unpack(self, out_dir: str, snapshot: int | None = None, overwrite: bool = False) -> list[str]:
+    def unpack(self, out_dir: str, snapshot: int | None = None, overwrite: bool = False,
+               fsync: bool = False) -> list[str]:
         """Restore a snapshot: files, directories (including empty ones),
         modification times, read-only / permission bits, Windows hidden /
         system attributes and symlinks. Symlinks are created last, so no
@@ -1617,7 +1648,11 @@ class StoreReader:
 
         Existing files, links or folders in the way are never replaced unless
         overwrite=True: the whole snapshot is checked first and
-        RestoreConflictError lists them before anything is written."""
+        RestoreConflictError lists them before anything is written.
+
+        fsync=True makes each restored file durable before it is renamed into
+        place (and, on POSIX, each directory at the end): slower, but a power
+        cut right after the restore cannot leave empty or partial files."""
         root = os.path.realpath(out_dir)
         snap = self._snapshot(snapshot)
         if not overwrite and os.path.isdir(root):
@@ -1659,6 +1694,9 @@ class StoreReader:
                 with open(tmp, "wb") as fh:
                     for c in self.iter_file(e):
                         fh.write(c)
+                    if fsync:
+                        fh.flush()
+                        os.fsync(fh.fileno())
                 if os.path.exists(dest):
                     _make_writable(dest)
                 os.replace(tmp, dest)
@@ -1688,6 +1726,16 @@ class StoreReader:
                 _apply_meta(dest, e)        # after the contents, so the mtime sticks
             except OSError as ex:
                 warnings.append(f"{e.path}: metadata not restored ({ex.strerror or ex})")
+        if fsync and os.name != "nt":       # Windows cannot open a directory to fsync it
+            for d in {root} | {os.path.dirname(os.path.join(root, *_safe_parts(e.path))) for e in snap.entries}:
+                try:
+                    fd = os.open(d, os.O_RDONLY)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                except OSError:
+                    pass
         return warnings
 
     def check_layout(self):
@@ -1791,7 +1839,10 @@ class StoreReader:
         for num, bad in damaged.items():
             total = len(self.snapshots[num - 1].entries)
             problems.append(f"snapshot {num}: {len(bad)} of {total} item(s) cannot be restored intact")
-        return {"problems": problems, "damaged_files": damaged, "bad_packs": bad_packs, "files": n}
+        par = Parity(self.f.name)
+        pstat = par.check() if snapshot is None and par.exists() else None
+        return {"problems": problems, "damaged_files": damaged, "bad_packs": bad_packs, "files": n,
+                "parity": pstat}
 
     def verify(self, snapshot: int | None = None, strict: bool = True) -> int:
         """Like scan(), but raises IntegrityError if anything is wrong.
@@ -1817,6 +1868,284 @@ class StoreReader:
         self.close()
 
 
+# --------------------------------------------------------------------------
+# Parity: Reed-Solomon recovery data in a sidecar '<store>.hcp'
+#
+# The store file is cut into shards of SHARD bytes; every K consecutive data
+# shards form a group, and M parity shards are computed for it (systematic
+# Reed-Solomon over GF(256) with a Cauchy matrix). Each shard's 16-byte BLAKE2b
+# is recorded, so damaged shards are located exactly and treated as erasures:
+# any M damaged shards per group (data or parity) can be rebuilt. Parity covers
+# EVERY byte of the store (packs, manifests, footers, the dictionary), so no
+# region is a single point of failure. A rebuilt shard is written back only if
+# its hash equals the recorded one: stale or wrong parity can never write
+# anything but the exact original bytes. See FORMAT.md, section 7.
+# --------------------------------------------------------------------------
+PARITY_MAGIC = b"HCPAR001"
+PAR_HDR = struct.Struct("<8sIHHQI32sI")          # magic, shard, k, m, covered, groups, reserved, crc
+PARITY_SHARD, PARITY_K, PARITY_M = 64 << 10, 16, 2
+
+
+def _gf_tables():
+    exp = np.zeros(512, dtype=np.uint8)
+    log = np.zeros(256, dtype=np.int32)
+    x = 1
+    for i in range(255):
+        exp[i] = x
+        log[x] = i
+        x <<= 1
+        if x & 0x100:
+            x ^= 0x11D
+    exp[255:510] = exp[:255]
+    mul = np.zeros((256, 256), dtype=np.uint8)
+    a = np.arange(1, 256)
+    for c in range(1, 256):
+        mul[c, 1:] = exp[(log[c] + log[a]) % 255]
+    return exp, log, mul
+
+
+_GF_EXP, _GF_LOG, _GF_MUL = _gf_tables()
+
+
+def _gf_inv(a: int) -> int:
+    return int(_GF_EXP[255 - _GF_LOG[a]])
+
+
+def _gf_mul(a: int, b: int) -> int:
+    return int(_GF_MUL[a, b])
+
+
+def _cauchy(k: int, m: int) -> list[list[int]]:
+    """M x K Cauchy matrix: every square submatrix is invertible, so any K of
+    the K+M shards determine the rest."""
+    return [[_gf_inv(j ^ (m + i)) for i in range(k)] for j in range(m)]
+
+
+def _gf_invert(a: list[list[int]]) -> list[list[int]]:
+    n = len(a)
+    a = [row[:] + [int(i == r) for i in range(n)] for r, row in enumerate(a)]
+    for col in range(n):
+        piv = next(r for r in range(col, n) if a[r][col])
+        a[col], a[piv] = a[piv], a[col]
+        inv = _gf_inv(a[col][col])
+        a[col] = [_gf_mul(v, inv) for v in a[col]]
+        for r in range(n):
+            if r != col and a[r][col]:
+                f = a[r][col]
+                a[r] = [v ^ _gf_mul(f, w) for v, w in zip(a[r], a[col])]
+    return [row[n:] for row in a]
+
+
+def _gf_combine(coefs: list[int], shards: list[np.ndarray]) -> np.ndarray:
+    out = np.zeros(len(shards[0]), dtype=np.uint8)
+    for c, s in zip(coefs, shards):
+        if c:
+            out ^= s if c == 1 else _GF_MUL[c][s]
+    return out
+
+
+def _shard_hash(b) -> bytes:
+    return hashlib.blake2b(b, digest_size=16).digest()
+
+
+class Parity:
+    """The '<store>.hcp' sidecar. Layout: a 64-byte header, then one fixed-size
+    record per group: u32 group | u32 data_len | (K+M) x 16-byte BLAKE2b (data
+    shards zero-padded to SHARD, then parity shards) | u32 crc32 of the fields
+    before it | M x SHARD parity bytes."""
+
+    def __init__(self, store: str):
+        self.store, self.path = store, store + ".hcp"
+
+    # ---- layout ----
+    def _rec_size(self, k, m, shard):
+        return 8 + 16 * (k + m) + 4 + m * shard
+
+    def _read_header(self, f):
+        raw = f.read(PAR_HDR.size)
+        if len(raw) != PAR_HDR.size:
+            raise IntegrityError("parity file header is truncated")
+        magic, shard, k, m, covered, groups, _, crc = PAR_HDR.unpack(raw)
+        if magic != PARITY_MAGIC or zlib.crc32(raw[:-4]) & 0xFFFFFFFF != crc:
+            raise IntegrityError("parity file header is damaged")
+        if not (shard and 0 < m and 0 < k and k + m <= 255 and groups == -(-covered // (k * shard))):
+            raise IntegrityError("parity file header is inconsistent")
+        return shard, k, m, covered
+
+    @staticmethod
+    def _header(shard, k, m, covered):
+        groups = -(-covered // (k * shard))
+        raw = PAR_HDR.pack(PARITY_MAGIC, shard, k, m, covered, groups, b"\0" * 32, 0)
+        return raw[:-4] + struct.pack("<I", zlib.crc32(raw[:-4]) & 0xFFFFFFFF)
+
+    def _group_data(self, sf, g, k, shard, size):
+        """The K data shards of group g (zero-padded), and how many store bytes it holds."""
+        start = g * k * shard
+        n = max(0, min(k * shard, size - start))
+        sf.seek(start)
+        raw = sf.read(n)
+        buf = np.zeros(k * shard, dtype=np.uint8)
+        buf[:len(raw)] = np.frombuffer(raw, dtype=np.uint8)
+        return [buf[i * shard:(i + 1) * shard] for i in range(k)], n
+
+    def _record(self, g, data, n, k, m, shard):
+        C = _cauchy(k, m)
+        par = [_gf_combine(C[j], data) for j in range(m)]
+        head = struct.pack("<II", g, n) + b"".join(_shard_hash(s) for s in data + par)
+        return head + struct.pack("<I", zlib.crc32(head) & 0xFFFFFFFF) + b"".join(p.tobytes() for p in par)
+
+    def _parse_record(self, raw, g, k, m, shard):
+        hl = 8 + 16 * (k + m)
+        if len(raw) != self._rec_size(k, m, shard):
+            return None
+        head, crc = raw[:hl], struct.unpack_from("<I", raw, hl)[0]
+        if zlib.crc32(head) & 0xFFFFFFFF != crc or struct.unpack_from("<I", head)[0] != g:
+            return None
+        n = struct.unpack_from("<I", head, 4)[0]
+        hashes = [head[8 + 16 * i:24 + 16 * i] for i in range(k + m)]
+        o = hl + 4
+        par = [np.frombuffer(raw, dtype=np.uint8, count=shard, offset=o + j * shard) for j in range(m)]
+        return n, hashes, par
+
+    # ---- writing ----
+    def exists(self) -> bool:
+        return os.path.exists(self.path)
+
+    def build(self, shard=PARITY_SHARD, k=PARITY_K, m=PARITY_M) -> dict:
+        """(Re)compute parity for the whole store into a new sidecar."""
+        tmp = self.path + "-new"
+        size = os.path.getsize(self.store)
+        with open(self.store, "rb") as sf, open(tmp, "wb") as pf:
+            pf.write(self._header(shard, k, m, size))
+            for g in range(-(-size // (k * shard))):
+                data, n = self._group_data(sf, g, k, shard, size)
+                pf.write(self._record(g, data, n, k, m, shard))
+            pf.flush()
+            os.fsync(pf.fileno())
+        os.replace(tmp, self.path)
+        return {"covered": size, "bytes": os.path.getsize(self.path)}
+
+    def update(self, from_offset: int) -> dict:
+        """After an append (or truncation) at from_offset: recompute only the
+        groups from the one holding from_offset to the end. The bytes of that
+        first group before from_offset are checked against their recorded
+        hashes first, so damage in old data is never baked into new parity."""
+        size = os.path.getsize(self.store)
+        with open(self.path, "r+b") as pf, open(self.store, "rb") as sf:
+            shard, k, m, covered = self._read_header(pf)
+            rs = self._rec_size(k, m, shard)
+            g0 = min(from_offset, covered) // (k * shard)
+            if g0 * k * shard < min(from_offset, covered):
+                pf.seek(PAR_HDR.size + g0 * rs)
+                rec = self._parse_record(pf.read(rs), g0, k, m, shard)
+                data, _ = self._group_data(sf, g0, k, shard, size)
+                keep = min(from_offset, covered) - g0 * k * shard
+                for i in range(-(-keep // shard)):
+                    a = i * shard
+                    if a + shard <= keep:
+                        old = data[i].tobytes()
+                    elif rec is not None and keep == rec[0]:     # pure append: old tail shard was zero-padded
+                        old = data[i][:keep - a].tobytes() + b"\0" * (shard - (keep - a))
+                    else:
+                        continue                                 # bytes after the cut changed legitimately
+                    if rec is None or _shard_hash(old) != rec[1][i]:
+                        raise IntegrityError(f"stored bytes before offset {from_offset:,} do not match their "
+                                             f"parity record; run `repair` (parity was not updated)")
+            groups = -(-size // (k * shard))
+            for g in range(g0, groups):
+                data, n = self._group_data(sf, g, k, shard, size)
+                pf.seek(PAR_HDR.size + g * rs)
+                pf.write(self._record(g, data, n, k, m, shard))
+            pf.truncate(PAR_HDR.size + groups * rs)
+            pf.seek(0)
+            pf.write(self._header(shard, k, m, size))
+            pf.flush()
+            os.fsync(pf.fileno())
+        return {"covered": size, "groups_written": groups - g0}
+
+    # ---- checking / repairing ----
+    def check(self, fix: bool = False) -> dict:
+        """Hash every shard of the store against the parity records. With
+        fix=True, damaged data shards are rebuilt and written back in place
+        (only when the rebuilt bytes hash to the recorded value)."""
+        res = {"covered": 0, "size": os.path.getsize(self.store), "groups": 0, "bad_shards": 0,
+               "repaired_shards": 0, "unrepairable_groups": [], "bad_records": [], "header_ok": True}
+        try:
+            pf = open(self.path, "rb")
+        except OSError:
+            res["header_ok"] = False
+            return res
+        with pf, open(self.store, "r+b" if fix else "rb") as sf:
+            try:
+                shard, k, m, covered = self._read_header(pf)
+            except IntegrityError as e:
+                res["header_ok"] = False
+                res["error"] = str(e)
+                return res
+            res.update(covered=covered, groups=-(-covered // (k * shard)))
+            rs, C = self._rec_size(k, m, shard), _cauchy(k, m)
+            size = res["size"]
+            for g in range(res["groups"]):
+                rec = self._parse_record(pf.read(rs), g, k, m, shard)
+                if rec is None:
+                    res["bad_records"].append(g)
+                    continue
+                n, hashes, par = rec
+                data, have = self._group_data(sf, g, k, shard, min(size, g * k * shard + n))
+                bad = [i for i in range(k) if _shard_hash(data[i]) != hashes[i]]
+                if have < n:                                 # store shorter than recorded
+                    bad = sorted(set(bad) | set(range(have // shard, -(-n // shard))))
+                if not bad:
+                    continue
+                res["bad_shards"] += len(bad)
+                good_par = [j for j in range(m) if _shard_hash(par[j]) == hashes[k + j]]
+                if len(bad) > len(good_par):
+                    res["unrepairable_groups"].append(g)
+                    continue
+                # Solve for the bad data shards from the good ones + enough good parity.
+                use = good_par[:len(bad)]
+                rows, vecs = [], []
+                for i in range(k):
+                    if i not in bad:
+                        rows.append([int(t == i) for t in range(k)])
+                        vecs.append(data[i])
+                for j in use:
+                    rows.append(C[j])
+                    vecs.append(par[j])
+                inv = _gf_invert(rows)
+                fixed = {i: _gf_combine(inv[i], vecs) for i in bad}
+                if any(_shard_hash(fixed[i]) != hashes[i] for i in bad):
+                    res["unrepairable_groups"].append(g)       # parity does not belong to this data
+                    continue
+                if fix:
+                    for i in bad:
+                        a = g * k * shard + i * shard
+                        ln = min(shard, n - i * shard)
+                        sf.seek(a)
+                        sf.write(fixed[i][:ln].tobytes())
+                    res["repaired_shards"] += len(bad)
+            if fix and res["repaired_shards"]:
+                sf.flush()
+                os.fsync(sf.fileno())
+        return res
+
+
+def parity_summary(c: dict) -> str:
+    if not c["header_ok"]:
+        return "parity: none" if "error" not in c else f"parity: unusable ({c['error']})"
+    parts = [f"parity covers {c['covered']:,} of {c['size']:,} store bytes"]
+    if c["bad_shards"]:
+        parts.append(f"{c['bad_shards']} damaged shard(s) found"
+                     + (f", {len(c['unrepairable_groups'])} group(s) beyond repair" if c["unrepairable_groups"]
+                        else ", all repairable with `repair`"))
+    else:
+        parts.append("no damaged shards")
+    if c["bad_records"]:
+        parts.append(f"{len(c['bad_records'])} parity record(s) damaged (rebuilt by `repair` once the store "
+                     f"verifies)")
+    return "; ".join(parts)
+
+
 def repair(path: str) -> list[str]:
     """Fix what can be fixed without losing anything, under the store lock:
 
@@ -1833,14 +2162,40 @@ def repair(path: str) -> list[str]:
     lock = _StoreLock(path)
     try:
         done = []
-        with StoreReader(path) as r:
-            tail, end, size = r.tail_snapshot, r.end, r.file_size
-            fix = []
-            for s in r.snapshots[:-1]:
-                if r._read(s.block_end, FOOTER.size) != FOOTER.pack(s.offset, STORE_MAGIC):
-                    fix.append((s.block_end, s.offset))
-        if not fix and end == size:
-            return done
+        par = Parity(path)
+        if par.exists():
+            c = par.check(fix=True)
+            if c["repaired_shards"]:
+                done.append(f"rebuilt {c['repaired_shards']} damaged {PARITY_SHARD >> 10} KiB shard(s) "
+                            f"from parity (each checked against its recorded hash)")
+            if c["unrepairable_groups"]:
+                done.append(f"could NOT rebuild {len(c['unrepairable_groups'])} group(s): too many damaged "
+                            f"shards, or the parity does not match the store")
+        done += _repair_footers(path)
+        if par.exists():
+            c = par.check()
+            if not c["header_ok"] or c["bad_records"] or c["unrepairable_groups"] or c["covered"] != c["size"]:
+                with StoreReader(path) as r:
+                    clean = not r.scan()["problems"]
+                if clean:
+                    par.build()
+                    done.append("rebuilt the parity file from the verified store")
+        return done
+    finally:
+        lock.release()
+
+
+def _repair_footers(path: str) -> list[str]:
+    """Footer / tail part of repair (the caller holds the lock)."""
+    done = []
+    with StoreReader(path) as r:
+        tail, end, size = r.tail_snapshot, r.end, r.file_size
+        fix = []
+        for s in r.snapshots[:-1]:
+            if r._read(s.block_end, FOOTER.size) != FOOTER.pack(s.offset, STORE_MAGIC):
+                fix.append((s.block_end, s.offset))
+    if not fix and end == size:
+        return done
         with open(path, "r+b") as f:
             for pos, moff in fix:
                 f.seek(pos)
@@ -1857,8 +2212,6 @@ def repair(path: str) -> list[str]:
             f.flush()
             os.fsync(f.fileno())
         return done
-    finally:
-        lock.release()
 
 
 # --------------------------------------------------------------------------
@@ -2075,15 +2428,21 @@ def prune(path: str, remove, repack_below: float = 0.5, level: int = 19, dry_run
             if len(r2.snapshots) != len(kept):
                 raise IntegrityError("pruned store has the wrong number of snapshots")
             r2.verify()
+        had_parity = Parity(path).exists()
+        if had_parity:
+            Parity(out).build()
         os.replace(out, path)
+        if had_parity:
+            os.replace(out + ".hcp", path + ".hcp")
         ps.bytes_after = os.path.getsize(path)
         return ps
     except BaseException:
-        try:
-            if os.path.exists(out):
-                os.remove(out)
-        except OSError:
-            pass
+        for leftover in (out, out + ".hcp", out + ".hcp-new"):
+            try:
+                if os.path.exists(leftover):
+                    os.remove(leftover)
+            except OSError:
+                pass
         raise
     finally:
         lock.release()
@@ -2104,12 +2463,13 @@ def _fmt(st: Stats) -> str:
 
 
 def _write(store: str, src: str, append: bool, level: int = 19, workers: int | None = None,
-           rehash: bool = False) -> int:
+           rehash: bool = False, parity: bool | None = None, pack_mb: float = 1) -> int:
     if not os.path.isdir(src):
         print(f"error: {src} is not a directory", file=sys.stderr)
         return 2
     t0 = time.time()
-    w = StoreWriter(store, codec=BlockCodec(zstd_level=level), append=append, workers=workers)
+    w = StoreWriter(store, codec=BlockCodec(zstd_level=level), append=append, workers=workers, parity=parity,
+                    pack_target=max(1 << 16, int(pack_mb * (1 << 20))))
     if w.recovered_bytes:
         print(f"note: discarded {w.recovered_bytes:,} bytes left by an interrupted earlier run",
               file=sys.stderr)
@@ -2129,9 +2489,13 @@ def _write(store: str, src: str, append: bool, level: int = 19, workers: int | N
               file=sys.stderr)
         for path in st.changed[:50]:
             print(f"  {path}", file=sys.stderr)
+    if st.parity.startswith("warning"):
+        print(st.parity, file=sys.stderr)
+    elif st.parity:
+        print(f"parity {st.parity}: {store}.hcp")
     if st.skipped:
         _print_skipped(st.skipped)
-    return 3 if st.skipped or st.changed else 0
+    return 3 if st.skipped or st.changed or st.parity.startswith("warning") else 0
 
 
 def _prune_cli(a) -> int:
@@ -2170,10 +2534,14 @@ def _prune_cli(a) -> int:
 def _report(r: "StoreReader", strict: bool = True, limit: int = 20) -> int:
     """Full verify: print every problem and every damaged file. 0 = intact, 1 = damage."""
     rep = r.scan(strict=strict)
+    pline = parity_summary(rep["parity"]) if rep["parity"] else \
+        "parity: none (`hybridstore.py parity <store>` adds Reed-Solomon recovery data)"
     if not rep["problems"]:
         print(f"verified {rep['files']} files across {len(r.snapshots)} snapshot(s): layout, blocks, "
               f"index and files all intact")
+        print(pline)
         return 0
+    print(pline, file=sys.stderr)
     print(f"DAMAGE FOUND: {len(rep['problems'])} problem(s)", file=sys.stderr)
     for p in rep["problems"]:
         print(f"  {p}", file=sys.stderr)
@@ -2210,12 +2578,17 @@ def main(argv) -> int:
                        help="zstd level 1-22 (default 19; 9 is ~15x faster for ~10%% less ratio)")
         p.add_argument("--workers", type=int, default=None,
                        help="threads (default: CPU count, max 16; 1 = single-threaded)")
+        p.add_argument("--pack-mb", type=float, default=1, metavar="MB",
+                       help="solid pack size (default 1). 4 is ~5%% smaller on text but each first "
+                            "read of a file decodes up to 4 MB (~3x slower random reads)")
         if name == "backup":
             p.add_argument("--rehash", action="store_true",
                            help="read every file, even ones whose size and mtime are unchanged")
         else:
             p.add_argument("--force", action="store_true",
                            help="replace an existing store (all its snapshots are lost)")
+            p.add_argument("--no-parity", action="store_true",
+                           help="do not write Reed-Solomon recovery data (<store>.hcp, ~12.5%% of the store)")
     p = sub.add_parser("list", help="list snapshots")
     p.add_argument("store")
     p.add_argument("--skipped", action="store_true", help="also list items each snapshot could not read")
@@ -2224,8 +2597,13 @@ def main(argv) -> int:
     p.add_argument("--snapshot", type=int, default=None, help="1-based snapshot number")
     p.add_argument("--force", action="store_true",
                    help="replace files / links that already exist in output_dir (default: refuse)")
-    p = sub.add_parser("repair", help="fix damaged footers / a cut-off newest snapshot (loses nothing)")
+    p.add_argument("--fsync", action="store_true",
+                   help="make every restored file durable before renaming it into place (slower)")
+    p = sub.add_parser("repair", help="rebuild damaged bytes from parity, fix footers (loses nothing)")
     p.add_argument("store")
+    p = sub.add_parser("parity", help="add or refresh Reed-Solomon recovery data (<store>.hcp)")
+    p.add_argument("store")
+    p.add_argument("--remove", action="store_true", help="delete the recovery data instead")
     p = sub.add_parser("prune", help="delete snapshots and reclaim their space (by number and/or policy)")
     p.add_argument("store")
     p.add_argument("--remove", type=int, nargs="+", default=[], metavar="N",
@@ -2257,12 +2635,33 @@ def main(argv) -> int:
                 print(f"error: {a.store} is {what}; `pack` would replace it. Use `backup` to add a "
                       f"snapshot, or `pack --force` to replace it", file=sys.stderr)
                 return 2
-            return _write(a.store, a.input_dir, append=False, level=a.level, workers=a.workers)
+            return _write(a.store, a.input_dir, append=False, level=a.level, workers=a.workers,
+                          parity=False if a.no_parity else None, pack_mb=a.pack_mb)
         if a.cmd == "backup":
             return _write(a.store, a.input_dir, append=True, level=a.level, workers=a.workers,
-                          rehash=a.rehash)
+                          rehash=a.rehash, pack_mb=a.pack_mb)
         if a.cmd == "prune":
             return _prune_cli(a)
+        if a.cmd == "parity":
+            lock = _StoreLock(a.store)
+            try:
+                par = Parity(a.store)
+                if a.remove:
+                    if par.exists():
+                        os.remove(par.path)
+                    print("parity removed")
+                    return 0
+                with StoreReader(a.store) as r:
+                    if r.scan()["problems"]:
+                        print("error: the store has damage; parity is only built over a verified store "
+                              "(run `verify` / `repair` first)", file=sys.stderr)
+                        return 1
+                info = par.build()
+                print(f"parity written: {par.path}, {info['bytes']:,} bytes for {info['covered']:,} store bytes "
+                      f"({100 * info['bytes'] / max(info['covered'], 1):.1f}%)")
+                return 0
+            finally:
+                lock.release()
         if a.cmd == "repair":
             done = repair(a.store)
             for d in done:
@@ -2286,7 +2685,7 @@ def main(argv) -> int:
                 print(f"store size {r.end:,} bytes")
             elif a.cmd == "unpack":
                 try:
-                    warnings = r.unpack(a.output_dir, a.snapshot, overwrite=a.force)
+                    warnings = r.unpack(a.output_dir, a.snapshot, overwrite=a.force, fsync=a.fsync)
                 except RestoreConflictError as e:
                     print(f"error: {e}", file=sys.stderr)
                     return 2

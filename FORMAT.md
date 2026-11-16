@@ -243,3 +243,39 @@ The new store must pass a full `verify` before it is renamed over the old one.
   `<store>.hcs-new` and renames it over the old store only after the footer is
   durable.
 * Readers take no lock. They see the newest complete snapshot.
+
+## 7. Parity sidecar (`<store>.hcp`)
+
+Optional Reed-Solomon recovery data, in a separate file so the store format
+is unchanged and old readers ignore it. It covers **every byte** of the
+store (packs, manifests, footers, dictionary) up to `covered`.
+
+```
+header (64 bytes): "HCPAR001" | u32 shard | u16 k | u16 m | u64 covered | u32 groups
+                   | 32 reserved | u32 crc32 of the 60 bytes before it
+record per group:  u32 group | u32 data_len | (k+m) x 16-byte BLAKE2b
+                   | u32 crc32 of the fields before it | m x shard parity bytes
+```
+
+* Defaults: shard 64 KiB, k = 16, m = 2. Group g holds store bytes
+  `[g·k·shard, (g+1)·k·shard)`, cut into k data shards; the last ones are
+  zero-padded to `shard`. Records are fixed-size, at `64 + g × record_size`.
+* Parity shard j is `Σ_i C[j][i] · data_i` over GF(256) (polynomial 0x11D),
+  with the Cauchy matrix `C[j][i] = 1 / (j XOR (m + i))`. Any k of the k+m
+  shards determine the others.
+* The hashes are BLAKE2b-128 of each data shard (zero-padded) and each parity
+  shard. They locate damage exactly, so any m damaged shards per group (data
+  or parity) are erasures that can be rebuilt. A group with more is reported
+  and left alone. A burst of up to m × shard (128 KiB) per 1 MiB group is
+  repairable.
+* **Never write unproven bytes.** A rebuilt shard is written back only if its
+  BLAKE2b equals the recorded one. Parity that belongs to another store or an
+  older state can therefore never change the store.
+* **Updates.** After an append, only the groups from the one holding the old
+  end of the store onward are recomputed. The shards of that first group that
+  lie before the old end are checked against their recorded hashes first; if
+  one does not match, the update is refused (the old damage is repaired with
+  the old parity instead of being baked into new parity).
+* `prune` computes parity for the new store before it replaces the old one.
+* A record whose crc32 fails, or a stale `covered`, is rebuilt by `repair`
+  only after the store itself verifies.
