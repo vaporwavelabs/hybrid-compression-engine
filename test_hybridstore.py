@@ -367,10 +367,16 @@ def _():
     w = hs.StoreWriter(store); w.add_tree(src); stats = w.close()
     assert stats.dirs == 3 and stats.links == links and stats.files == 3, stats
     out = os.path.join(TMP, "meta_out")
-    for _ in range(2):                               # second restore overwrites read-only / hidden files
+    for k in range(2):                               # second restore overwrites read-only / hidden files
         with hs.StoreReader(store) as r:
             assert r.verify() == 3
-            warnings = r.unpack(out)
+            if k:
+                try:
+                    r.unpack(out)
+                    raise AssertionError("restore over existing files was not refused")
+                except hs.RestoreConflictError as e:
+                    assert "a.txt" in e.conflicts and "d/b.txt" in e.conflicts, e.conflicts
+            warnings = r.unpack(out, overwrite=bool(k))
     assert warnings == [], warnings
     same_tree(src, out)
     assert os.path.isdir(os.path.join(out, "empty", "deeper"))
@@ -517,6 +523,234 @@ def _():
     w = hs.StoreWriter(store)                        # overwrite mode
     w.add_file("x.bin", os.urandom(100_000)); w.abort()
     assert open(store, "rb").read() == before and not os.path.exists(store + ".hcs-new")
+
+
+# ---------------------------------------------------------------- safeguards (2026-11-15 review)
+
+def _quiet(*argv):
+    import contextlib
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = hs.main(list(argv))
+    return code, out.getvalue() + err.getvalue()
+
+
+def _flip(path, off):
+    with open(path, "r+b") as f:
+        f.seek(off); b = f.read(1); f.seek(off); f.write(bytes([b[0] ^ 0x5A]))
+
+
+def _three_snapshots(name):
+    src = os.path.join(TMP, name)
+    store = os.path.join(TMP, name + ".hcs")
+    for k in range(3):
+        tree(src, {f"f{i}.txt": text(200_000, 1000 * k + i) for i in range(3 + k)})
+        w = hs.StoreWriter(store, append=True); w.add_tree(src); w.close()
+    return src, store
+
+
+@check("damaged or missing newest footer: backup refuses instead of deleting the snapshot; repair restores it")
+def _():
+    src, store = _three_snapshots("footer")
+    good = open(store, "rb").read()
+    for how in ("flip", "missing"):
+        open(store, "wb").write(good)
+        if how == "flip":
+            _flip(store, len(good) - 4)                 # bit rot in the magic of the newest footer
+        else:
+            open(store, "r+b").truncate(len(good) - hs.FOOTER.size)   # crash after the manifest's fsync
+        before = open(store, "rb").read()
+        with hs.StoreReader(store) as r:
+            assert len(r.snapshots) == 2 and r.tail_snapshot is not None, how
+        try:
+            hs.StoreWriter(store, append=True)
+            raise AssertionError("backup accepted a store whose newest snapshot lost its footer")
+        except hs.IntegrityError as e:
+            assert "repair" in str(e)
+        assert open(store, "rb").read() == before, "a refused backup changed the store"
+        assert _quiet("verify", store)[0] == 1
+        done = hs.repair(store)
+        assert len(done) == 1 and open(store, "rb").read() == good, (how, done)
+        with hs.StoreReader(store) as r:
+            assert len(r.snapshots) == 3 and r.verify() == 3 + 4 + 5
+    # A damaged older footer: verify fails, repair rewrites it in place.
+    with hs.StoreReader(store) as r:
+        pos = r.snapshots[0].block_end
+    _flip(store, pos + 2)
+    with hs.StoreReader(store) as r:
+        assert len(r.snapshots) == 3
+        try:
+            r.verify(); raise AssertionError("damaged old footer passed verify")
+        except hs.IntegrityError:
+            pass
+    assert hs.repair(store) and open(store, "rb").read() == good and hs.repair(store) == []
+    # An interrupted write (packs, no manifest) is still discarded by the next backup.
+    tree(src, {"big.bin": os.urandom(2_000_000)})
+    w = hs.StoreWriter(store, append=True); w.add_tree(src); w._flush(); w._drain(); w._shutdown()
+    w.f.close(); w.lock.release()
+    with hs.StoreReader(store) as r:
+        assert r.tail_snapshot is None and len(r.snapshots) == 3
+    w = hs.StoreWriter(store, append=True); assert w.recovered_bytes > 0; w.add_tree(src); w.close()
+    with hs.StoreReader(store) as r:
+        assert len(r.snapshots) == 4 and r.verify() > 0
+
+
+@check("`pack` refuses to replace an existing store without --force")
+def _():
+    src, store = _three_snapshots("packguard")
+    before = open(store, "rb").read()
+    code, out = _quiet("pack", src, store)
+    assert code == 2 and "3 snapshot(s)" in out and open(store, "rb").read() == before, out
+    other = os.path.join(TMP, "notastore.bin"); open(other, "wb").write(b"precious")
+    assert _quiet("pack", src, other)[0] == 2 and open(other, "rb").read() == b"precious"
+    code, _ = _quiet("pack", src, store, "--force")
+    with hs.StoreReader(store) as r:
+        assert code == 0 and len(r.snapshots) == 1
+
+
+@check("unpack never overwrites existing files unless told to; unrelated files in the folder are fine")
+def _():
+    src, store = _three_snapshots("unpackguard")
+    out = os.path.join(TMP, "unpackguard_out")
+    tree(out, {"mine.txt": b"unrelated, untouched", "f0.txt": b"TODAY'S WORK"})
+    code, msg = _quiet("unpack", store, out)
+    assert code == 2 and "f0.txt" in msg, msg
+    assert open(os.path.join(out, "f0.txt"), "rb").read() == b"TODAY'S WORK"
+    assert not os.path.exists(os.path.join(out, "f1.txt")), "a refused restore wrote files"
+    os.remove(os.path.join(out, "f0.txt"))
+    assert _quiet("unpack", store, out)[0] == 0                      # only unrelated files: allowed
+    assert open(os.path.join(out, "mine.txt"), "rb").read() == b"unrelated, untouched"
+    open(os.path.join(out, "f0.txt"), "wb").write(b"edited")
+    assert _quiet("unpack", store, out, "--force")[0] == 0
+    assert open(os.path.join(out, "f0.txt"), "rb").read() == open(os.path.join(src, "f0.txt"), "rb").read()
+
+
+@check("files changing while read are re-read once, then reported; small (threaded) and streamed paths")
+def _():
+    real_open = open
+
+    class Grower:
+        """A file handle that appends to its own file every time it is read."""
+        def __init__(self, path, f, budget):
+            self.path, self.f, self.budget = path, f, budget
+
+        def read(self, *a):
+            d = self.f.read(*a)
+            if d and self.budget[self.path] > 0:
+                self.budget[self.path] -= 1
+                with real_open(self.path, "ab") as g:
+                    g.write(b"+")
+            return d
+
+        def __getattr__(self, k):
+            return getattr(self.f, k)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *e):
+            self.f.close()
+
+    for workers in (1, 4):
+        src = os.path.join(TMP, f"busy{workers}")
+        tree(src, {"calm.txt": text(50_000, 5), "once.txt": text(50_000, 6), "busy.txt": text(50_000, 7),
+                   "big_once.bin": os.urandom(9 << 20)})
+        budget = {}
+        # once.txt / big_once.bin change during their first read only; busy.txt during every read
+        budget.update({os.path.join(src, "once.txt"): 1, os.path.join(src, "big_once.bin"): 1,
+                       os.path.join(src, "busy.txt"): 10**9})
+        budget_by_name = {os.path.basename(p): None for p in budget}
+        hs.open = lambda path, mode="r", *a, **k: (
+            Grower(path, real_open(path, mode, *a, **k), budget)
+            if "r" in mode and os.path.basename(str(path)) in budget_by_name else real_open(path, mode, *a, **k))
+        try:
+            store = os.path.join(TMP, f"busy{workers}.hcs")
+            w = hs.StoreWriter(store, workers=workers); w.add_tree(src); st = w.close()
+        finally:
+            del hs.open
+        assert st.changed == ["busy.txt"], (workers, st.changed)
+        assert st.files == 4, st
+        with hs.StoreReader(store) as r:
+            names = [e.path for e in r.snapshots[-1].files]
+            assert sorted(names) == ["big_once.bin", "busy.txt", "calm.txt", "once.txt"], names
+            for n in ("calm.txt", "once.txt", "big_once.bin"):   # the re-read copy is the current file
+                e = next(e for e in r.snapshots[-1].files if e.path == n)
+                assert r.read_file(e) == open(os.path.join(src, n), "rb").read(), (workers, n)
+            e = next(e for e in r.snapshots[-1].files if e.path == "busy.txt")
+            assert e.mtime_ns != os.stat(os.path.join(src, "busy.txt")).st_mtime_ns or \
+                e.size != os.path.getsize(os.path.join(src, "busy.txt"))   # next backup re-reads it
+            r.verify()
+
+
+@check("verify lists every damaged pack and every affected file, in every snapshot")
+def _():
+    src = os.path.join(TMP, "scan")
+    store = os.path.join(TMP, "scan.hcs")
+    tree(src, {f"f{i}.bin": os.urandom(700_000) for i in range(8)})
+    w = hs.StoreWriter(store, append=True); w.add_tree(src); w.close()
+    tree(src, {"extra.bin": os.urandom(500_000)})
+    w = hs.StoreWriter(store, append=True); w.add_tree(src); w.close()
+    with hs.StoreReader(store) as r:
+        offs = r.pack_offsets
+        hit = [0, len(r.snapshots[0].packs) - 1]            # two packs of snapshot 1
+        expect = {n: sorted(e.path for e in s.entries if any(p >> hs.PTR_SHIFT in hit for p in e.pointers))
+                  for n, s in enumerate(r.snapshots, 1)}
+    for pid in hit:
+        _flip(store, offs[pid] + hs.HDR.size + 1000)
+    with hs.StoreReader(store) as r:
+        rep = r.scan()
+        assert sorted(rep["bad_packs"]) == hit, rep["bad_packs"]
+        got = {n: sorted(p for p, _ in v) for n, v in rep["damaged_files"].items()}
+        assert got == {n: v for n, v in expect.items() if v}, (got, expect)
+        assert expect[1] and expect[2]                      # dedup: the damage reaches snapshot 2 too
+        try:
+            r.verify(); raise AssertionError
+        except hs.IntegrityError as e:
+            assert "more problem(s)" in str(e)
+    code, out = _quiet("verify", store)
+    assert code == 1 and all(p in out for p in expect[1]) and "intact snapshots" in out, out
+
+
+@check("a damaged manifest loses only that snapshot: the rest stays readable, backup works, prune drops it")
+def _():
+    src, store = _three_snapshots("mdamage")
+    copies = {}
+    with hs.StoreReader(store) as r:
+        for n in (1, 3):
+            copies[n] = {e.path: r.read_file(e) for e in r.snapshots[n - 1].files}
+        moff = r.snapshots[1].offset
+        newest = r.snapshots[2].offset
+    good = open(store, "rb").read()
+    _flip(store, moff + hs.HDR.size + 7)
+    with hs.StoreReader(store) as r:
+        assert r.damaged == [2] and len(r.snapshots) == 3
+        for n in (1, 3):
+            assert {e.path: r.read_file(e) for e in r.snapshots[n - 1].files} == copies[n]
+        try:
+            r.unpack(os.path.join(TMP, "md_out2"), snapshot=2); raise AssertionError
+        except hs.IntegrityError:
+            pass
+        rep = r.scan()
+        assert any("snapshot 2" in p and "manifest damaged" in p for p in rep["problems"]), rep["problems"]
+        assert not rep["damaged_files"], rep["damaged_files"]
+    try:
+        hs.prune(store, [1]); raise AssertionError("prune kept a damaged snapshot")
+    except ValueError as e:
+        assert "[2]" in str(e)
+    w = hs.StoreWriter(store, append=True); w.add_tree(src); w.close()      # backups keep working
+    with hs.StoreReader(store) as r:
+        assert r.damaged == [2] and len(r.snapshots) == 4
+    ps = hs.prune(store, [2])
+    with hs.StoreReader(store) as r:
+        assert ps.removed == [2] and r.damaged == [] and len(r.snapshots) == 3 and r.verify() > 0
+        assert {e.path: r.read_file(e) for e in r.snapshots[0].files} == copies[1]
+        assert {e.path: r.read_file(e) for e in r.snapshots[1].files} == copies[3]
+    # The NEWEST manifest damaged (its footer intact): older snapshots stay readable.
+    open(store, "wb").write(good)
+    _flip(store, newest + hs.HDR.size + 7)
+    with hs.StoreReader(store) as r:
+        assert r.damaged == [3]
+        assert {e.path: r.read_file(e) for e in r.snapshots[0].files} == copies[1]
 
 
 if __name__ == "__main__":

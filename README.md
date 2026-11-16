@@ -17,7 +17,7 @@ It lists five Phase I bugs and Phase II fixes: a naive XOR boundary test (fix: a
 | `hybridstore.py` | The engine and CLI (commands below) |
 | `bench.py` | Builds the sample datasets, checks round trips, runs an incremental-backup run and the corruption test, compares against baselines |
 | `bench_large.py` | Packs, verifies and restores one large file (default 2 GiB) and reports peak memory |
-| `test_hybridstore.py` | 20 checks: streaming, snapshots, v1 compatibility, crash recovery, path safety, large media, locking, skipped files, strict verify, decompression bombs, metadata, unchanged-file reuse, prune (copy/repack/dictionary, policies, dry run, refusals) |
+| `test_hybridstore.py` | 26 checks: streaming, snapshots, v1 compatibility, crash recovery, path safety, large media, locking, skipped files, strict verify, decompression bombs, metadata, unchanged-file reuse, prune (copy/repack/dictionary, policies, dry run, refusals), and the safeguards (damaged footers and manifests, `pack`/`unpack` refusals, files changing while read, full damage reports) |
 | `FORMAT.md` | Byte-level specification of the store format |
 | `hybridstore.cmd` | Windows launcher that uses the local `.venv` |
 | `hybridstore_mcp.py` | Read-only MCP server: lets an LLM list, read, search and diff snapshots without unpacking (see below) |
@@ -35,11 +35,12 @@ Requirements: Python 3.10+, numpy, `zstandard` (optional; without it only zlib i
 ### Commands
 
 ```
-python hybridstore.py pack   <input_dir> <store> [--level N] [--workers N]  # new store (overwrites)
+python hybridstore.py pack   <input_dir> <store> [--level N] [--workers N] [--force]  # new store; --force to replace one
 python hybridstore.py backup <input_dir> <store> [--level N] [--workers N] [--rehash]  # add a snapshot; creates the store if missing
 python hybridstore.py list   <store> [--skipped]                 # show snapshots (and what each could not read)
-python hybridstore.py unpack <store> <output_dir> [--snapshot N] # default: newest snapshot
-python hybridstore.py verify <store> [--allow-partial]           # check layout, every block, the index and every file
+python hybridstore.py unpack <store> <output_dir> [--snapshot N] [--force]  # default: newest; --force replaces existing files
+python hybridstore.py verify <store> [--allow-partial]           # check everything; lists ALL damage and affected files
+python hybridstore.py repair <store>                             # fix damaged footers; never loses data
 ```
 
 Exit codes:
@@ -47,11 +48,28 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | 0 | OK |
-| 1 | Integrity error, or `verify` found a cut-short store |
-| 3 | Finished with warnings: `backup`/`pack` skipped unreadable items, or `unpack` could not create some symlinks |
+| 1 | Integrity error, or `verify` found damage or a cut-short store |
+| 2 | Refused because it would destroy data: `pack` onto an existing store, or `unpack` over existing files (use `--force`) |
+| 3 | Finished with warnings: `backup`/`pack` skipped unreadable items or stored files that kept changing while read, or `unpack` could not create some symlinks |
 | 4 | Another backup is writing to the store |
 
 The byte-level format is specified in [FORMAT.md](FORMAT.md).
+
+### Safeguards against data loss (2026-11-15 review)
+
+A review damaged a scratch store on purpose. Detection was already complete, but some damage cost more than it had to, and some commands could destroy data without a warning. All of these now have a test in `test_hybridstore.py`:
+
+| Situation | Before | Now |
+|---|---|---|
+| Newest snapshot's footer damaged (bit rot) or never written (crash after the manifest's fsync) | the next `backup` silently cut the whole snapshot off, exit 0 | `backup` refuses and changes nothing; `repair` writes the footer again and the snapshot is back |
+| An older snapshot's manifest (file list) damaged | the whole store would not open, newest snapshot included | only that snapshot is lost: the reader finds every snapshot and pack by walking the block headers; `list` marks it DAMAGED; backups keep working; `prune --remove N` rebuilds the store without it |
+| `pack` onto an existing store | all snapshots replaced, no warning | refused (exit 2) unless `--force` |
+| `unpack` into a folder with files of the same name | overwritten, no warning | the whole snapshot is checked first; refused (exit 2) before writing anything, unless `--force`. Unrelated files in the folder are fine |
+| A file written to while it is being backed up | a mixed old/new copy stored, exit 0 | size + mtime are checked after reading; the file is read once more; if it is still changing it is stored but listed, exit 3 (the next backup reads it again) |
+| Damage found by `verify` | stopped at the first error | lists every damaged pack and every affected file in every snapshot, and which snapshots are fully intact |
+| A damaged older footer | `verify` failed with no fix | `repair` rewrites it in place |
+
+`repair` only writes footers (16 bytes each) and cuts off bytes that hold no complete snapshot; it never touches data blocks. Damaged packs cannot be repaired: each holds the only copy of its chunks (deduplication keeps one copy), so one bad byte loses every file with data in that pack, in every snapshot that uses it. Protect against that with a second copy of the store on another disk, or parity data (planned: Reed-Solomon), and run `verify` on a schedule.
 
 ### Hardening (Phase 1)
 

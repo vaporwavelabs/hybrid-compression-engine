@@ -132,6 +132,9 @@ class StoreTools:
             n = len(r.snapshots)
         if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= len(r.snapshots):
             raise ToolError(f"snapshot {n!r} does not exist; the store has snapshots 1..{len(r.snapshots)}")
+        if r.snapshots[n - 1].damaged:
+            raise ToolError(f"snapshot {n} is damaged: its file list cannot be read ({r.snapshots[n - 1].damaged}); "
+                            f"other snapshots are readable")
         return n, r.snapshots[n - 1]
 
     @staticmethod
@@ -167,6 +170,9 @@ class StoreTools:
             out = [f"store size {_size(r.end)} ({r.end:,} bytes), {len(r.snapshots)} snapshot(s)",
                    f"{'#':>3}  {'created':19}  {'files':>7}  {'input size':>10}  {'skipped':>7}  source"]
             for i, s in enumerate(r.snapshots, 1):
+                if s.damaged:
+                    out.append(f"{i:>3}  DAMAGED: file list unreadable; this snapshot cannot be read")
+                    continue
                 out.append(f"{i:>3}  {_when(s.created):19}  {len(s.files):>7}  {_size(s.input_bytes):>10}  "
                            f"{len(s.skipped):>7}  {s.label}")
             if len(self.stores) > 1:
@@ -410,6 +416,9 @@ class StoreTools:
         with self._open(a) as r:
             out, prev, found = [f"history of {want}"], None, False
             for i, s in enumerate(r.snapshots, 1):
+                if s.damaged:
+                    out.append(f"{i:>3}  (snapshot damaged: unknown)")
+                    continue
                 e = next((e for e in s.entries if e.path == want and e.kind == hs.KIND_FILE), None)
                 if e is None:
                     state, cur = ("deleted" if prev is not None else "absent"), None

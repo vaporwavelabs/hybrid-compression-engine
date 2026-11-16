@@ -35,13 +35,15 @@ Usage:
   python hybridstore.py pack   <input_dir> <store_file>       new store (overwrites)
   python hybridstore.py backup <input_dir> <store_file>       add a snapshot (creates if missing)
   python hybridstore.py list   <store_file> [--skipped]
-  python hybridstore.py unpack <store_file> <output_dir> [--snapshot N]
+  python hybridstore.py unpack <store_file> <output_dir> [--snapshot N] [--force]
   python hybridstore.py verify <store_file> [--allow-partial]
+  python hybridstore.py repair <store_file>                    fix damaged footers (loses nothing)
   python hybridstore.py prune  <store_file> [--remove N ...] [--keep-last N] [--keep-daily N]
                                [--keep-weekly N] [--keep-monthly N] [--dry-run]
 
-Exit codes: 0 ok, 1 integrity error, 3 finished with warnings (items skipped /
-symlinks not restored), 4 store locked by another backup. Format: FORMAT.md.
+Exit codes: 0 ok, 1 integrity error, 2 refused (would overwrite data; see --force),
+3 finished with warnings (items skipped or changed while read / symlinks not
+restored), 4 store locked by another backup. Format: FORMAT.md.
 """
 from __future__ import annotations
 
@@ -113,6 +115,17 @@ class IntegrityError(Exception):
 
 class StoreLockedError(Exception):
     """Another process (or another writer in this process) is writing the store."""
+
+
+class RestoreConflictError(Exception):
+    """unpack would overwrite existing files and overwrite=False."""
+
+    def __init__(self, conflicts: list[str]):
+        self.conflicts = conflicts
+        more = f" (and {len(conflicts) - 5} more)" if len(conflicts) > 5 else ""
+        super().__init__(f"{len(conflicts)} item(s) already exist in the output folder and would be "
+                         f"overwritten: {', '.join(conflicts[:5])}{more}. Nothing was written. Restore into "
+                         f"an empty folder, or pass overwrite=True / --force to replace them")
 
 
 class _StoreLock:
@@ -599,6 +612,7 @@ class Snapshot:
     index_ptrs: list[int] = field(default_factory=list)
     block_end: int = 0          # end of the manifest block (footer follows)
     skipped: list[tuple[str, str]] = field(default_factory=list)   # (path, reason), v3
+    damaged: str = ""           # non-empty: the manifest could not be read; entries are lost
 
     @property
     def input_bytes(self) -> int:
@@ -633,6 +647,7 @@ class Stats:
     reused_files: int = 0       # unchanged since the previous snapshot: not read again
     reused_bytes: int = 0
     skipped: list = field(default_factory=list)   # (path, reason) of files that could not be read
+    changed: list = field(default_factory=list)   # paths still changing after a re-read (stored anyway)
 
 
 def _encode_pack(chunks: list[bytes]) -> bytes:
@@ -687,6 +702,11 @@ def _norm_path(rel: str) -> str:
 
 def _meta(st: os.stat_result) -> tuple[int, int, int]:
     return st.st_mtime_ns, st.st_mode, getattr(st, "st_file_attributes", 0)
+
+
+def _sig(st: os.stat_result) -> tuple[int, int]:
+    """What must not change while a file is being read."""
+    return st.st_size, st.st_mtime_ns
 
 
 def _is_link(path: str) -> bool:
@@ -774,6 +794,11 @@ class StoreWriter:
         self.recovered_bytes = 0               # tail bytes dropped from an interrupted write
         if append and os.path.exists(path) and os.path.getsize(path) > 0:
             with StoreReader(path, codec=self.codec, load_index=True) as r:
+                if r.tail_snapshot is not None:
+                    raise IntegrityError(
+                        f"{path}: the newest snapshot (#{len(r.snapshots) + 1}) is complete but its footer "
+                        f"is damaged or missing, so it is not visible. Nothing was changed. Run "
+                        f"`hybridstore.py repair {path}` to restore it, then back up again")
                 self.pack_offsets = list(r.pack_offsets)
                 self.index = r.index
                 self.prev_manifest = r.snapshots[-1].offset
@@ -930,11 +955,12 @@ class StoreWriter:
                 fst = os.fstat(fh.fileno())
                 meta = _meta(fst)
                 if fst.st_size > PREP_MAX:
-                    return None, meta
+                    return None, meta, True
                 data = fh.read(PREP_MAX + 1)
+                stable = _sig(os.fstat(fh.fileno())) == _sig(fst)
         except OSError as e:
             return e
-        return (None if len(data) > PREP_MAX else self._prepare_bytes(data)), meta
+        return (None if len(data) > PREP_MAX else self._prepare_bytes(data)), meta, stable
 
     def _add_prepared(self, rel_path: str, prep, meta: tuple | None = None):
         kind, size, sha, chunks, digests, dh = prep
@@ -1124,21 +1150,41 @@ class StoreWriter:
                     st_.reused_bytes += p.size
                     continue
                 pfull, res = next(prepared)
-                assert pfull == full
-                if isinstance(res, BaseException):
-                    raise res
-                prep, meta = res if res is not None else (None, None)
-                if prep is not None:
-                    self._add_prepared(rel, prep, meta)
-                else:
-                    with open(full, "rb") as fh:
-                        self.add_stream(rel, fh, meta or _meta(os.fstat(fh.fileno())))
+                if pfull != full:
+                    raise RuntimeError(f"internal error: file order mismatch ({pfull} vs {full})")
+                for attempt in (1, 2):
+                    mark = (len(self.entries), st_.files, st_.input_bytes, st_.media_files)
+                    if self._add_file(rel, full, res):
+                        break
+                    if attempt == 2:
+                        st_.changed.append(_norm_path(rel))
+                        break
+                    # Changed while it was read: drop that copy and read it once more.
+                    del self.entries[mark[0]:]
+                    st_.files, st_.input_bytes, st_.media_files = mark[1:]
+                    res = self._prepare_path(full)
             except OSError as e:
                 self._skip(rel, e)
 
+    def _add_file(self, rel: str, full: str, res) -> bool:
+        """Add one regular file (prepared in a worker, or streamed here).
+        Returns False if its size or mtime changed while it was being read:
+        the copy may then mix old and new content. The entry keeps the mtime
+        from before the read, so the next backup reads the file again."""
+        if isinstance(res, BaseException):
+            raise res
+        if res is not None and res[0] is not None:
+            prep, meta, stable = res
+            self._add_prepared(rel, prep, meta)
+            return stable
+        with open(full, "rb") as fh:
+            before = os.fstat(fh.fileno())
+            self.add_stream(rel, fh, _meta(before))
+            return _sig(os.fstat(fh.fileno())) == _sig(before)
+
     def _prepared(self, files):
         """Yield (path, result) in input order, where result is what
-        _prepare_path returns: (prep-or-None, meta) or an OSError. With a
+        _prepare_path returns: (prep-or-None, meta, stable) or an OSError. With a
         pool, small files are read, chunked and hashed ahead in worker
         threads (bounded look-ahead, so memory stays around
         4 x workers x PREP_MAX at worst). Without one, result is None."""
@@ -1260,9 +1306,37 @@ class StoreReader:
             self.codec.set_dictionary(d)
             self.has_dict = True
         moff, self.end = self._locate_footer(size)
+        try:
+            chain = self._chain(moff, load_index)
+        except IntegrityError as e:
+            # A manifest in the chain is damaged. The layout is strictly sequential, so
+            # walking the block headers still finds every snapshot and every pack; only
+            # the damaged snapshots' file lists are lost.
+            chain = self._chain_by_walking(load_index, e)
+        self.snapshots: list[Snapshot] = chain
+        self.pack_offsets: list[int] = []
+        for s in chain:
+            if s.first_pack != len(self.pack_offsets):
+                raise IntegrityError(f"pack ids out of order in snapshot at {s.offset}")
+            self.pack_offsets.extend(s.packs)
+        self.entries = chain[-1].entries        # newest snapshot (v1 API)
+        self._cache: OrderedDict[int, list[bytes]] = OrderedDict()
+        self._cache_max = cache_bytes           # decoded-pack cache budget
+        self._cache_used = 0
+        self.index: dict[bytes, int] = {}
+        if load_index:
+            self._build_index()
+        self.tail_snapshot = self._find_tail_snapshot() if self.end != size else None
         if self.end != size:
-            print(f"warning: ignoring {size - self.end:,} trailing bytes from an interrupted "
-                  f"write; using the last complete snapshot", file=sys.stderr)
+            print(f"warning: {self._tail_message()}", file=sys.stderr)
+        self.damaged = [i for i, s in enumerate(chain, 1) if s.damaged]
+        if self.damaged:
+            print(f"warning: the file list of snapshot(s) {self.damaged} is damaged and cannot be read; "
+                  f"the other snapshots are readable. `verify` lists all damage; `prune --remove "
+                  f"{' '.join(map(str, self.damaged))}` rebuilds the store without them", file=sys.stderr)
+
+    def _chain(self, moff: int, load_index: bool) -> list[Snapshot]:
+        """Follow the manifests' prev links back from the newest one."""
         chain, off = [], moff
         while True:
             m, flags, bend = self._block(off)
@@ -1279,19 +1353,93 @@ class StoreReader:
         chain.reverse()
         if chain[0].version >= 2 and chain[0].prev != 0:
             raise IntegrityError("snapshot chain does not start at the first snapshot")
-        self.snapshots: list[Snapshot] = chain
-        self.pack_offsets: list[int] = []
-        for s in chain:
-            if s.first_pack != len(self.pack_offsets):
-                raise IntegrityError(f"pack ids out of order in snapshot at {s.offset}")
-            self.pack_offsets.extend(s.packs)
-        self.entries = chain[-1].entries        # newest snapshot (v1 API)
-        self._cache: OrderedDict[int, list[bytes]] = OrderedDict()
-        self._cache_max = cache_bytes           # decoded-pack cache budget
-        self._cache_used = 0
-        self.index: dict[bytes, int] = {}
-        if load_index:
-            self._build_index()
+        return chain
+
+    def _walk_blocks(self, start: int, stop: int):
+        """Walk forward from a block boundary reading only headers. Yields
+        ("block", off, flags, end), ("footer", off, intact, end) for the 16
+        bytes after each manifest, and ("bad", off, None, None) where the
+        bytes are neither (the walk stops there)."""
+        pos, after_manifest = start, None
+        while pos < stop:
+            raw = self._read(pos, HDR.size)
+            if after_manifest is not None:          # a manifest is always followed by its footer
+                ok = (len(raw) == FOOTER.size and raw[8:] == STORE_MAGIC
+                      and struct.unpack_from("<Q", raw)[0] == after_manifest)
+                yield "footer", pos, ok, pos + FOOTER.size
+                pos += FOOTER.size
+                after_manifest = None
+                continue
+            if len(raw) != HDR.size or raw[:3] != BLOCK_MAGIC:
+                yield "bad", pos, None, None
+                return
+            flags, end = raw[3], pos + HDR.size + HDR.unpack(raw)[3]
+            if end > stop:
+                yield "bad", pos, None, None
+                return
+            yield "block", pos, flags, end
+            after_manifest = pos if flags & FLAG_MANIFEST else None
+            pos = end
+
+    def _chain_by_walking(self, load_index: bool, cause: IntegrityError) -> list[Snapshot]:
+        start = len(STORE_MAGIC)
+        if self.has_dict:
+            start += HDR.size + HDR.unpack(self._read(start, HDR.size))[3]
+        chain, packs, n_packs, prev = [], [], 0, 0
+        for kind, off, flags, end in self._walk_blocks(start, self.end):
+            if kind == "bad":
+                raise IntegrityError(f"{cause}; walking the store block by block also failed at {off}")
+            if kind == "footer" or not flags & FLAG_MANIFEST:
+                if kind == "block":
+                    packs.append(off)
+                continue
+            try:
+                m, _, _ = self._block(off)
+                snap = self._parse_manifest(m, off, load_index)
+                if snap.first_pack != n_packs or snap.packs != packs:
+                    raise IntegrityError(f"manifest at {off} does not match the packs before it")
+            except IntegrityError as e:
+                snap = Snapshot(off, 0, prev, 0, "", n_packs, packs, [], damaged=f"manifest damaged ({e})")
+            snap.block_end = end
+            chain.append(snap)
+            n_packs += len(packs)
+            packs, prev = [], off
+        if not chain or chain[-1].block_end + FOOTER.size != self.end:
+            raise IntegrityError(f"{cause}; walking the store block by block did not reach its end")
+        return chain
+
+    def _find_tail_snapshot(self) -> tuple[int, int] | None:
+        """Bytes follow the last complete snapshot. If they hold a complete
+        snapshot (packs + manifest, fsynced before its footer) whose footer is
+        missing or damaged, return (manifest_offset, manifest_end); None means
+        an interrupted write that published nothing."""
+        last = self.snapshots[-1]
+        packs = []
+        for kind, off, flags, end in self._walk_blocks(self.end, self.file_size):
+            if kind != "block":
+                return None
+            if not flags & FLAG_MANIFEST:
+                packs.append(off)
+                continue
+            try:
+                m, _, _ = self._block(off)
+                snap = self._parse_manifest(m, off, False)
+            except IntegrityError:
+                return None
+            ok = (snap.prev == last.offset and snap.first_pack == len(self.pack_offsets)
+                  and snap.packs == packs and self.file_size - end <= FOOTER.size)
+            return (off, end) if ok else None
+        return None
+
+    def _tail_message(self) -> str:
+        extra = self.file_size - self.end
+        if self.tail_snapshot is not None:
+            return (f"the newest snapshot (#{len(self.snapshots) + 1}) is complete but its footer is damaged "
+                    f"or missing, so only snapshots 1..{len(self.snapshots)} are visible; "
+                    f"`hybridstore.py repair` restores it")
+        return (f"{extra:,} bytes after the last complete snapshot hold no complete snapshot (an interrupted "
+                f"write, or the store was cut short so newer snapshots may be missing); "
+                f"the next backup discards them")
 
     # ---- low level ----
     def _read(self, off: int, n: int) -> bytes:
@@ -1398,6 +1546,8 @@ class StoreReader:
 
     def _build_index(self):
         for s in self.snapshots:
+            if s.damaged:
+                continue                # its chunks are simply stored again when next seen
             if s.version >= 2:
                 d = s.index_digests
                 for i, p in enumerate(s.index_ptrs):
@@ -1434,10 +1584,13 @@ class StoreReader:
 
     def _snapshot(self, snapshot: int | None) -> Snapshot:
         if snapshot is None or snapshot == -1:
-            return self.snapshots[-1]
+            snapshot = len(self.snapshots)
         if not 1 <= snapshot <= len(self.snapshots):
             raise ValueError(f"snapshot {snapshot} does not exist (store has {len(self.snapshots)})")
-        return self.snapshots[snapshot - 1]
+        s = self.snapshots[snapshot - 1]
+        if s.damaged:
+            raise IntegrityError(f"snapshot {snapshot}: {s.damaged}; its files cannot be listed or restored")
+        return s
 
     def iter_file(self, e: FileEntry):
         """Yield the file's chunks; raises IntegrityError at the end if the
@@ -1454,21 +1607,37 @@ class StoreReader:
     def read_file(self, e: FileEntry) -> bytes:
         return b"".join(self.iter_file(e))
 
-    def unpack(self, out_dir: str, snapshot: int | None = None) -> list[str]:
+    def unpack(self, out_dir: str, snapshot: int | None = None, overwrite: bool = False) -> list[str]:
         """Restore a snapshot: files, directories (including empty ones),
         modification times, read-only / permission bits, Windows hidden /
         system attributes and symlinks. Symlinks are created last, so no
         restored file is ever written through one. Returns warnings for
         things that could not be restored (e.g. symlinks on Windows without
-        the privilege to create them)."""
+        the privilege to create them).
+
+        Existing files, links or folders in the way are never replaced unless
+        overwrite=True: the whole snapshot is checked first and
+        RestoreConflictError lists them before anything is written."""
         root = os.path.realpath(out_dir)
+        snap = self._snapshot(snapshot)
+        if not overwrite and os.path.isdir(root):
+            clash = []
+            for e in snap.entries:
+                dest = os.path.join(root, *_safe_parts(e.path))
+                if e.kind == KIND_DIR:
+                    if os.path.lexists(dest) and not os.path.isdir(dest):
+                        clash.append(e.path)
+                elif os.path.lexists(dest):
+                    clash.append(e.path)
+            if clash:
+                raise RestoreConflictError(clash)
         os.makedirs(root, exist_ok=True)
         warnings, dirs, links = [], [], []
 
         def inside(p):
             return p == root or p.startswith(root + os.sep)
 
-        for e in self._snapshot(snapshot).entries:
+        for e in snap.entries:
             dest = os.path.join(root, *_safe_parts(e.path))
             if not inside(os.path.realpath(os.path.dirname(dest))):
                 raise IntegrityError(f"unsafe path in manifest: {e.path}")
@@ -1549,53 +1718,90 @@ class StoreReader:
         if pos != self.end:
             raise IntegrityError(f"store layout broken: {self.end - pos:,} unaccounted bytes before the footer")
 
-    def verify(self, snapshot: int | None = None, strict: bool = True) -> int:
-        """Check one snapshot's files, or (snapshot=None) the whole store.
-        Returns the number of regular files covered.
+    def scan(self, snapshot: int | None = None, strict: bool = True) -> dict:
+        """Check everything and collect EVERY problem instead of stopping at the
+        first. snapshot=None checks the whole store: byte layout, every pack's
+        CRC (including packs no file uses any more), that every dedup-index
+        entry points at a chunk with that SHA-256 (a bad index would corrupt
+        future backups), and every file of every snapshot. strict=True also
+        reports bytes past the last complete snapshot.
 
-        Whole-store checks: the byte layout (check_layout), every pack's CRC
-        (including packs no file uses any more), that every dedup-index entry
-        really points at a chunk with that SHA-256 (a bad index would corrupt
-        future backups), and every file's SHA-256. strict=True also fails if
-        the store has bytes past its last complete snapshot (an interrupted
-        write, or a store that was cut short and fell back to an older
-        snapshot)."""
+        Returns {"problems": [str], "damaged_files": {snapshot: [(path, why)]},
+        "bad_packs": {pack_id: why}, "files": regular files covered}."""
+        problems: list[str] = []
+        bad_packs: dict[int, str] = {}
+        damaged: dict[int, list] = {}
         if strict and self.end != self.file_size:
-            raise IntegrityError(
-                f"{self.file_size - self.end:,} bytes after the last complete snapshot: the store was "
-                f"cut short or a write was interrupted, so newer snapshots may be missing. "
-                f"The next backup discards them; verify with strict=False / --allow-partial to check the rest")
-        snaps = self.snapshots if snapshot is None else [self._snapshot(snapshot)]
+            problems.append(self._tail_message())
         if snapshot is None:
-            self.check_layout()
-            for s in self.snapshots:
-                if s.version >= 2:
+            nums = list(range(1, len(self.snapshots) + 1))
+            try:
+                self.check_layout()
+            except IntegrityError as e:
+                problems.append(str(e))
+            for num, s in enumerate(self.snapshots, 1):
+                want = {}
+                if s.damaged:
+                    problems.append(f"snapshot {num}: {s.damaged}; its file list is lost "
+                                    f"(`prune --remove {num}` rebuilds the store without it)")
+                elif s.version >= 2:
                     m, _, _ = self._block(s.offset)
                     full = self._parse_manifest(m, s.offset, keep_index=True)
                     want = {p: full.index_digests[32 * i:32 * i + 32] for i, p in enumerate(full.index_ptrs)}
-                else:
-                    want = {}
                 seen = 0
                 for k in range(len(s.packs)):
                     pid = s.first_pack + k
-                    for i, c in enumerate(self._pack(pid)):
+                    try:
+                        chunks = self._pack(pid)
+                    except IntegrityError as e:
+                        bad_packs[pid] = str(e)
+                        problems.append(f"pack {pid} (added by snapshot {num}) is damaged: {e}")
+                        continue
+                    for i, c in enumerate(chunks):
                         d = want.get((pid << PTR_SHIFT) | i)
                         if d is not None:
                             seen += 1
                             if hashlib.sha256(c).digest() != d:
-                                raise IntegrityError(f"dedup index entry for pack {pid} chunk {i} is wrong")
-                if seen != len(want):
-                    raise IntegrityError(f"dedup index of snapshot at {s.offset} points outside its packs")
-        done, n = set(), 0
-        for s in snaps:
+                                problems.append(f"dedup index entry for pack {pid} chunk {i} is wrong "
+                                                f"(snapshot {num}); later backups could reuse bad data")
+                if seen != len(want) and not any(s.first_pack + k in bad_packs for k in range(len(s.packs))):
+                    problems.append(f"dedup index of snapshot {num} points outside its packs")
+        else:
+            nums = [snapshot if snapshot != -1 else len(self.snapshots)]
+            self._snapshot(nums[0])             # ValueError / IntegrityError for a bad number
+        done: dict[tuple, str | None] = {}
+        n = 0
+        for num in nums:
+            s = self.snapshots[num - 1]
             for e in s.entries:
+                n += e.kind == KIND_FILE
                 key = (e.sha256, e.size, tuple(e.pointers))
                 if key not in done:
-                    for _ in self.iter_file(e):
-                        pass
-                    done.add(key)
-                n += e.kind == KIND_FILE
-        return n
+                    err = next((f"its data is in damaged pack {p >> PTR_SHIFT}" for p in e.pointers
+                                if p >> PTR_SHIFT in bad_packs), None)
+                    if err is None:
+                        try:
+                            for _ in self.iter_file(e):
+                                pass
+                        except IntegrityError as x:
+                            err = str(x)
+                    done[key] = err
+                if done[key]:
+                    damaged.setdefault(num, []).append((e.path, done[key]))
+        for num, bad in damaged.items():
+            total = len(self.snapshots[num - 1].entries)
+            problems.append(f"snapshot {num}: {len(bad)} of {total} item(s) cannot be restored intact")
+        return {"problems": problems, "damaged_files": damaged, "bad_packs": bad_packs, "files": n}
+
+    def verify(self, snapshot: int | None = None, strict: bool = True) -> int:
+        """Like scan(), but raises IntegrityError if anything is wrong.
+        Returns the number of regular files covered."""
+        rep = self.scan(snapshot, strict)
+        p = rep["problems"]
+        if p:
+            raise IntegrityError(p[0] + (f" (and {len(p) - 1} more problem(s); `verify` lists them all)"
+                                         if len(p) > 1 else ""))
+        return rep["files"]
 
     def unused_ranges(self) -> list[tuple[int, int]]:
         """Byte ranges no snapshot depends on (superseded footers)."""
@@ -1609,6 +1815,50 @@ class StoreReader:
 
     def __exit__(self, *exc):
         self.close()
+
+
+def repair(path: str) -> list[str]:
+    """Fix what can be fixed without losing anything, under the store lock:
+
+    * the newest snapshot is complete but its footer is damaged or was never
+      written: its footer is written again, which makes it visible;
+    * an older snapshot's footer is damaged: it is rewritten in place (only
+      `verify` and recovery read old footers);
+    * bytes after the last snapshot hold no complete snapshot (an interrupted
+      write): they are cut off, as the next backup would do.
+
+    Damaged packs or manifests cannot be repaired here: `verify` lists them,
+    and `prune --remove` can rebuild the store without damaged snapshots.
+    Returns a description of each change made (empty: nothing to do)."""
+    lock = _StoreLock(path)
+    try:
+        done = []
+        with StoreReader(path) as r:
+            tail, end, size = r.tail_snapshot, r.end, r.file_size
+            fix = []
+            for s in r.snapshots[:-1]:
+                if r._read(s.block_end, FOOTER.size) != FOOTER.pack(s.offset, STORE_MAGIC):
+                    fix.append((s.block_end, s.offset))
+        if not fix and end == size:
+            return done
+        with open(path, "r+b") as f:
+            for pos, moff in fix:
+                f.seek(pos)
+                f.write(FOOTER.pack(moff, STORE_MAGIC))
+                done.append(f"rewrote the damaged footer at byte {pos:,}")
+            if tail is not None:
+                f.truncate(tail[1])
+                f.seek(tail[1])
+                f.write(FOOTER.pack(tail[0], STORE_MAGIC))
+                done.append("wrote the missing/damaged footer of the newest snapshot, which is visible again")
+            elif end != size:
+                f.truncate(end)
+                done.append(f"cut off {size - end:,} bytes of an interrupted write (they held no snapshot)")
+            f.flush()
+            os.fsync(f.fileno())
+        return done
+    finally:
+        lock.release()
 
 
 # --------------------------------------------------------------------------
@@ -1680,6 +1930,10 @@ def prune(path: str, remove, repack_below: float = 0.5, level: int = 19, dry_run
             kept = [i for i in range(1, len(snaps) + 1) if i not in remove]
             if not kept:
                 raise ValueError("refusing to remove every snapshot")
+            dmg = [i for i in kept if snaps[i - 1].damaged]
+            if dmg:
+                raise ValueError(f"snapshot(s) {dmg} are damaged (their file lists are lost) and cannot be "
+                                 f"kept; add them to --remove to rebuild the store without them")
             ps = PruneStats(kept, sorted(remove), bytes_before=r.end, bytes_after=r.end, dry_run=dry_run)
             if not remove:
                 return ps
@@ -1869,10 +2123,15 @@ def _write(store: str, src: str, append: bool, level: int = 19, workers: int | N
     print(_fmt(st))
     read = st.input_bytes - st.reused_bytes
     print(f"time={dt:.1f}s (read {read / 1e6:.1f} MB at {read / 1e6 / dt if dt else 0:.1f} MB/s)")
+    if st.changed:
+        print(f"warning: {len(st.changed)} file(s) kept changing while they were read (read twice); they "
+              f"are stored, but each copy may mix old and new content. The next backup reads them again:",
+              file=sys.stderr)
+        for path in st.changed[:50]:
+            print(f"  {path}", file=sys.stderr)
     if st.skipped:
         _print_skipped(st.skipped)
-        return 3
-    return 0
+    return 3 if st.skipped or st.changed else 0
 
 
 def _prune_cli(a) -> int:
@@ -1908,6 +2167,28 @@ def _prune_cli(a) -> int:
     return 0
 
 
+def _report(r: "StoreReader", strict: bool = True, limit: int = 20) -> int:
+    """Full verify: print every problem and every damaged file. 0 = intact, 1 = damage."""
+    rep = r.scan(strict=strict)
+    if not rep["problems"]:
+        print(f"verified {rep['files']} files across {len(r.snapshots)} snapshot(s): layout, blocks, "
+              f"index and files all intact")
+        return 0
+    print(f"DAMAGE FOUND: {len(rep['problems'])} problem(s)", file=sys.stderr)
+    for p in rep["problems"]:
+        print(f"  {p}", file=sys.stderr)
+    for num, bad in sorted(rep["damaged_files"].items()):
+        print(f"snapshot {num}: {len(bad)} item(s) cannot be restored intact:", file=sys.stderr)
+        for path, why in bad[:limit]:
+            print(f"  {path}: {why}", file=sys.stderr)
+        if len(bad) > limit:
+            print(f"  ... and {len(bad) - limit} more", file=sys.stderr)
+    ok = [i for i in range(1, len(r.snapshots) + 1)
+          if i not in rep["damaged_files"] and not r.snapshots[i - 1].damaged]
+    print(f"intact snapshots: {ok or 'none'} of {len(r.snapshots)}", file=sys.stderr)
+    return 1
+
+
 def _print_skipped(skipped, limit=50):
     print(f"warning: {len(skipped)} item(s) could not be read and are NOT in this snapshot:",
           file=sys.stderr)
@@ -1932,12 +2213,19 @@ def main(argv) -> int:
         if name == "backup":
             p.add_argument("--rehash", action="store_true",
                            help="read every file, even ones whose size and mtime are unchanged")
+        else:
+            p.add_argument("--force", action="store_true",
+                           help="replace an existing store (all its snapshots are lost)")
     p = sub.add_parser("list", help="list snapshots")
     p.add_argument("store")
     p.add_argument("--skipped", action="store_true", help="also list items each snapshot could not read")
     p = sub.add_parser("unpack", help="restore a snapshot (default: newest)")
     p.add_argument("store"); p.add_argument("output_dir")
     p.add_argument("--snapshot", type=int, default=None, help="1-based snapshot number")
+    p.add_argument("--force", action="store_true",
+                   help="replace files / links that already exist in output_dir (default: refuse)")
+    p = sub.add_parser("repair", help="fix damaged footers / a cut-off newest snapshot (loses nothing)")
+    p.add_argument("store")
     p = sub.add_parser("prune", help="delete snapshots and reclaim their space (by number and/or policy)")
     p.add_argument("store")
     p.add_argument("--remove", type=int, nargs="+", default=[], metavar="N",
@@ -1960,16 +2248,36 @@ def main(argv) -> int:
 
     try:
         if a.cmd == "pack":
+            if not a.force and os.path.exists(a.store) and os.path.getsize(a.store) > 0:
+                try:
+                    with StoreReader(a.store) as r:
+                        what = f"a store with {len(r.snapshots)} snapshot(s)"
+                except (IntegrityError, OSError):
+                    what = "a file that is not empty"
+                print(f"error: {a.store} is {what}; `pack` would replace it. Use `backup` to add a "
+                      f"snapshot, or `pack --force` to replace it", file=sys.stderr)
+                return 2
             return _write(a.store, a.input_dir, append=False, level=a.level, workers=a.workers)
         if a.cmd == "backup":
             return _write(a.store, a.input_dir, append=True, level=a.level, workers=a.workers,
                           rehash=a.rehash)
         if a.cmd == "prune":
             return _prune_cli(a)
+        if a.cmd == "repair":
+            done = repair(a.store)
+            for d in done:
+                print(d)
+            if not done:
+                print("nothing to repair")
+            with StoreReader(a.store) as r:
+                return _report(r, strict=True)
         with StoreReader(a.store) as r:
             if a.cmd == "list":
                 print(f"{'#':>3}  {'created':19}  {'files':>7}  {'bytes':>15}  {'skipped':>7}  source")
                 for i, s in enumerate(r.snapshots, 1):
+                    if s.damaged:
+                        print(f"{i:>3}  DAMAGED: file list unreadable ({s.damaged})")
+                        continue
                     when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(s.created)) if s.created else "(v1 store)"
                     print(f"{i:>3}  {when:19}  {len(s.files):>7}  {s.input_bytes:>15,}  {len(s.skipped):>7}  {s.label}")
                     if a.skipped:
@@ -1977,15 +2285,17 @@ def main(argv) -> int:
                             print(f"       skipped {path}: {reason}")
                 print(f"store size {r.end:,} bytes")
             elif a.cmd == "unpack":
-                warnings = r.unpack(a.output_dir, a.snapshot)
+                try:
+                    warnings = r.unpack(a.output_dir, a.snapshot, overwrite=a.force)
+                except RestoreConflictError as e:
+                    print(f"error: {e}", file=sys.stderr)
+                    return 2
                 for w in warnings:
                     print(f"warning: {w}", file=sys.stderr)
                 print("ok" if not warnings else f"ok, with {len(warnings)} warning(s)")
                 return 3 if warnings else 0
             else:
-                n = r.verify(strict=not a.allow_partial)
-                print(f"verified {n} files across {len(r.snapshots)} snapshot(s): layout, blocks, "
-                      f"index and files all intact")
+                return _report(r, strict=not a.allow_partial)
         return 0
     except StoreLockedError as e:
         print(f"error: {e}", file=sys.stderr)

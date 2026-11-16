@@ -38,9 +38,27 @@ manifest decodes and whose manifest block ends exactly where that footer starts.
 Bytes after that point are **trailing bytes**:
 
 * Readers ignore them and print a warning.
-* The next `backup` truncates them.
+* If they hold a **complete snapshot** whose footer is missing or damaged
+  (walking the block headers from the end of the last complete snapshot
+  reaches a manifest that decodes, links to that snapshot, lists exactly the
+  packs before it, and is followed by at most 16 bytes), a writer must not
+  remove them. `backup` refuses; `repair` writes the footer again.
+* Otherwise (an interrupted write: packs without a manifest) the next
+  `backup` or `repair` truncates them.
 * `verify` fails (exit 1) while they exist, because newer snapshots may have
   been lost. `--allow-partial` checks everything else.
+
+### Damaged manifests
+
+If following the manifests' `prev` links fails (a manifest does not decode),
+a reader can still rebuild the snapshot list, because every byte belongs to
+a block or footer in a fixed order: walk the block headers from the start
+(after the dictionary), collecting packs until a MANIFEST block; the 16 bytes
+after a manifest are its footer. A manifest that decodes must list exactly
+the packs collected since the previous one. One that does not decode marks a
+**damaged snapshot**: its packs are known, its file list is lost. Other
+snapshots read normally. A damaged snapshot cannot be kept by `prune`;
+removing it rebuilds a clean store. This needs block headers to be intact.
 
 Limitation: if a store is cut exactly at an older footer boundary, it looks
 exactly like a valid store with fewer snapshots. Detecting that needs an
