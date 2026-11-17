@@ -23,6 +23,8 @@ It lists five Phase I bugs and Phase II fixes: a naive XOR boundary test (fix: a
 | `hybridstore_mcp.py` | Read-only MCP server: lets an LLM list, read, search and diff snapshots without unpacking (see below) |
 | `test_hybridstore_mcp.py` | 11 checks for the MCP server: each tool, paging (also inside very long lines), encodings, path safety, the stdio protocol, prune while the server runs |
 | `hybridstore-mcp.cmd` | Windows launcher for the MCP server |
+| `hybridstore_catalog.py` | Catalog `<store>.cat`: path versions across snapshots + exact substring index, so agents search without decoding the store (see below) |
+| `test_hybridstore_catalog.py` | 8 checks: case folding for every Unicode character, incremental updates, catalog search equal to a full scan on random patterns, behind / pruned / damaged catalogs, encrypted stores get none |
 | `hybridstore_semantic.py` | Semantic index: `index`, `search`, `status`, `gc` (see below) |
 | `test_hybridstore_semantic.py` | 7 checks for the semantic index, using a fake embedding server |
 | `llm_accuracy.py` | Scores what the LLM tools return from a store against the original files on disk |
@@ -49,9 +51,10 @@ python hybridstore.py verify <store> [--allow-partial]           # check everyth
 python hybridstore.py repair <store> [--dry-run]                 # rebuild from parity, fix footers; never loses data
 python hybridstore.py parity <store> [--m 2|4] [--remove]        # add/refresh parity; --m 4 doubles burst tolerance
 python hybridstore.py passwd <store> [--new-password-file F]     # change an encrypted store's password
+python hybridstore.py catalog <store> [--rebuild]                # build/update <store>.cat (backup does it automatically)
 ```
 
-`pack`/`backup` also take `--encrypt` (new stores only), `--cloud-files` (read OneDrive placeholders, which downloads them; default: skip and report), `--pack-mb N` and `--no-parity`. Every command takes `--password-file F`; the password can also come from `HYBRIDSTORE_PASSWORD`, else the CLI asks for it.
+`pack`/`backup` also take `--encrypt` (new stores only), `--cloud-files` (read OneDrive placeholders, which downloads them; default: skip and report), `--pack-mb N`, `--no-parity` and `--no-catalog`. Every command takes `--password-file F`; the password can also come from `HYBRIDSTORE_PASSWORD`, else the CLI asks for it.
 
 Exit codes:
 
@@ -357,8 +360,9 @@ python hybridstore_mcp.py --tools                                  # tool schema
 | `list_snapshots` | Snapshot numbers, times, file counts, sizes and source folders |
 | `list_files` | One directory (sub-directories with file counts, then files), or a flat list with `recursive` / `glob`; paged |
 | `read_file` | A text file with line numbers, paged by `start_line` / `max_lines`; UTF-8 and UTF-16; binary files get a one-line description |
-| `search` | grep over a snapshot's text files: literal or regex, `dir` / `glob` filters, context lines; identical files are searched once |
+| `search` | grep over a snapshot's text files: literal or regex, `dir` / `glob` filters, context lines; identical files are searched once. With a current catalog, only files that can contain a literal pattern are read |
 | `diff_snapshots` | Files added, deleted and modified between two snapshots, or a unified diff of one file |
+| `find_files` | Paths matching a name part and/or glob across ALL snapshots at once, each version with the snapshot numbers holding it (from the catalog when current, else the manifests) |
 | `file_history` | In which snapshots a file was added, changed or deleted |
 
 * **Read-only and confined.** No tool writes. The model cannot pass a store path: it can only use the stores named on the command line, and file paths are looked up in the snapshot's manifest, never on disk.
@@ -366,6 +370,27 @@ python hybridstore_mcp.py --tools                                  # tool schema
 * **Does not block backups.** The store is opened per call and closed again, so `backup` and `prune` work while the server is running, and the next call sees the new state.
 * **File contents are data.** Text from a backup may contain instructions aimed at a model. The tool descriptions say so, but the client should still treat it as untrusted.
 * **Measured** on the project's `site-packages` (2,544 files, 79.6 MB, 22.8 MB store), including Python start-up: listing 0.4 s; reading 3 lines at line 900 of a file 0.4 s; searching all 1,451 text files 0.8 s.
+
+#### The catalog (`<store>.cat`)
+
+`search` used to decode every text file of the snapshot on each call. The catalog is a SQLite file next to the store, kept up to date by `backup`, `pack` and `prune` (`--no-catalog` to skip; `hybridstore.py catalog <store> [--rebuild]` by hand). It holds:
+
+* every path version across all snapshots (content hash, size, time, first..last snapshot), which `find_files` answers from without opening manifests;
+* a substring index (SQLite FTS5 trigram, contentless) over every distinct text content, in passages of up to 64 KB. Each content is indexed once, by its SHA-256, so a file kept in 50 snapshots costs nothing extra.
+
+**Exact, not approximate.** The index only decides which files cannot contain the pattern. Text is indexed after the same case folding Python's `re.IGNORECASE` uses (checked for every Unicode character), so no file that could match is skipped. The candidates are then searched line by line as before. The tests run about 135 patterns (most of them random pieces of the indexed text, half with swapped letter case) through six option sets: both letter-case modes, `dir`, `glob`, context lines and an older snapshot. Every result equals a full scan. Regex searches, patterns under 3 characters and `max_file_mb` above 32 use the full scan.
+
+**Derived, never trusted over the store.** The catalog records which snapshots (by manifest offset) it covers and is used for a snapshot only when that matches the store exactly. If it is behind, `search` says so and scans. After a prune its snapshot list is rebuilt, but indexed contents are reused. A damaged catalog is set aside and rebuilt. Encrypted stores get none, because it would hold searchable plaintext-derived data unencrypted.
+
+| Real-run store (2.47 GB, 53,846 files; 34,641 text contents) | |
+|---|---|
+| Building the catalog | 70 s, 75 MB (3% of the source) |
+| `search` for a string that is nowhere | 6.7 s → 0.6 s |
+| `search` "ChaCha20" (18 candidate files) | 3.7 s → 0.7 s |
+| `search` "def main(" (901 candidate files) | 7.0 s → 2.9 s |
+| `find_files` across both snapshots | 0.3 s |
+
+About 0.5 s of each call is opening the store's file lists, which a resident server would keep open. While measuring this, a quadratic slowdown in the line reader showed up: a 10 MB line (a source map) was rebuilt piece by piece. Fixing it halved the full-scan times above.
 
 To add it to Claude Code:
 

@@ -2961,7 +2961,8 @@ def _fmt(st: Stats) -> str:
 
 def _write(store: str, src: str, append: bool, level: int = 19, workers: int | None = None,
            rehash: bool = False, parity: bool | None = None, pack_mb: float = 1,
-           encrypt: bool = False, cloud_files: bool = False, precheck: bool = True) -> int:
+           encrypt: bool = False, cloud_files: bool = False, precheck: bool = True,
+           catalog: bool = True) -> int:
     if not os.path.isdir(src):
         print(f"error: {src} is not a directory", file=sys.stderr)
         return 2
@@ -3000,7 +3001,29 @@ def _write(store: str, src: str, append: bool, level: int = 19, workers: int | N
         print(f"parity {st.parity}: {store}.hcp")
     if st.skipped:
         _print_skipped(st.skipped)
-    return 3 if st.skipped or st.changed or st.parity.startswith("warning") or st.precheck_fixed else 0
+    cat_ok = _update_catalog(store) if catalog else True
+    return 3 if (st.skipped or st.changed or st.parity.startswith("warning") or st.precheck_fixed
+                 or not cat_ok) else 0
+
+
+def _update_catalog(store: str) -> bool:
+    """Bring <store>.cat up to date after a write. The data is already safe, so
+    a failure here only warns. Encrypted stores get no catalog. False = warned."""
+    try:
+        import hybridstore_catalog as hc
+        with StoreReader(store) as r:
+            if r.encrypted:
+                return True
+            st = hc.update_store(store, r, log=lambda m: print(m, file=sys.stderr))
+        print(hc.summary(st))
+        return True
+    except StoreLockedError:
+        print("note: the catalog is being updated by another run; it will catch up", file=sys.stderr)
+        return True
+    except Exception as e:
+        print(f"warning: catalog not updated ({type(e).__name__}: {e}); the snapshot itself is complete. "
+              f"`hybridstore.py catalog {store}` retries", file=sys.stderr)
+        return False
 
 
 def _prune_cli(a) -> int:
@@ -3033,6 +3056,8 @@ def _prune_cli(a) -> int:
     if not ps.dry_run:
         print(f"new store verified; remaining snapshots renumbered 1..{len(ps.kept)}; "
               f"time={time.time() - t0:.1f}s")
+        if os.path.exists(a.store + ".cat") and not _update_catalog(a.store):
+            return 3
     return 0
 
 
@@ -3095,6 +3120,9 @@ def main(argv) -> int:
                        help="zstd level 1-22 (default 19; 9 is ~15x faster for ~10%% less ratio)")
         p.add_argument("--workers", type=int, default=None,
                        help="threads (default: CPU count, max 16; 1 = single-threaded)")
+        p.add_argument("--no-catalog", action="store_true",
+                       help="do not create / update the catalog (<store>.cat) that lets agents search without "
+                            "decoding the store")
         p.add_argument("--pack-mb", type=float, default=1, metavar="MB",
                        help="solid pack size (default 1). 4 is ~5%% smaller on text but each first "
                             "read of a file decodes up to 4 MB (~3x slower random reads)")
@@ -3130,6 +3158,10 @@ def main(argv) -> int:
                         f"{PARITY_M} = 12.5%%; 4 = 25%%, survives 4 MiB bursts per 16 MiB)")
     p.add_argument("--depth", type=int, default=None, metavar="D",
                    help=f"interleaving depth (default {PARITY_DEPTH}; 1 = the original layout)")
+    p = sub.add_parser("catalog", help="build / update the catalog (<store>.cat) agents use to find and search "
+                                       "without decoding the store")
+    p.add_argument("store")
+    p.add_argument("--rebuild", action="store_true", help="discard the catalog and build it again from the store")
     p = sub.add_parser("passwd", help="change the password of an encrypted store")
     p.add_argument("store")
     p.add_argument("--new-password-file", metavar="FILE", default=None,
@@ -3289,13 +3321,22 @@ def _main(a) -> int:
                 return 2
             return _write(a.store, a.input_dir, append=False, level=a.level, workers=a.workers,
                           parity=False if a.no_parity else None, pack_mb=a.pack_mb, encrypt=a.encrypt,
-                          cloud_files=a.cloud_files)
+                          cloud_files=a.cloud_files, catalog=not a.no_catalog)
         if a.cmd == "backup":
             return _write(a.store, a.input_dir, append=True, level=a.level, workers=a.workers,
                           rehash=a.rehash, pack_mb=a.pack_mb, encrypt=a.encrypt,
-                          cloud_files=a.cloud_files, precheck=not a.no_precheck)
+                          cloud_files=a.cloud_files, precheck=not a.no_precheck, catalog=not a.no_catalog)
         if a.cmd == "prune":
             return _prune_cli(a)
+        if a.cmd == "catalog":
+            import hybridstore_catalog as hc
+            try:
+                st = hc.update_store(a.store, rebuild=a.rebuild, log=lambda m: print(m, file=sys.stderr))
+            except hc.CatalogError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
+            print(hc.summary(st))
+            return 0
         if a.cmd == "parity":
             lock = _StoreLock(a.store)
             try:
