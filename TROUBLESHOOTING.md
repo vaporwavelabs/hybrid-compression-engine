@@ -1,5 +1,7 @@
 # Troubleshooting
 
+**Start with `python doctor.py check <store>`** (or `fix`): it runs the checks below, applies the fixes marked safe here automatically, and prints the rule and next step for the rest. `python doctor.py bugs` lists crashes and repeated failures from the event log, with known causes.
+
 Each entry gives the symptom, what it means, and what to do, safest step first. One rule covers all of them: **before any `repair`, `prune` or `--force`, copy the store and its `.hcp` sidecar somewhere else.** Repairs here never write a byte that does not hash to its recorded value, but a copy costs minutes and protects against the cause you have not found yet: a failing disk, bad RAM, a full volume.
 
 ## 1. `verify` reports damage (exit 1)

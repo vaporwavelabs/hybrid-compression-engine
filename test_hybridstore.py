@@ -6,6 +6,7 @@ import hashlib, importlib.util, io, os, random, shutil, subprocess, sys, tempfil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+os.environ["HYBRIDSTORE_LOG"] = "off"      # the tests' expected failures must not fill the real event log
 import hybridstore as hs
 np = hs.np
 

@@ -33,6 +33,8 @@ It lists five Phase I bugs and Phase II fixes: a naive XOR boundary test (fix: a
 | `monitor.py` | Runs any command and prints elapsed time, MB read, MB/s, ETA, CPU cores and RAM every 10 s (optional CSV) |
 | `real_run.py` | Full real-data run under the monitor: pack, unchanged backup, verify, restore + SHA-256 compare, encrypted pack, damage + repair, `zstd -19 --long` baseline |
 | `TROUBLESHOOTING.md` | What to do when something goes wrong, with sources |
+| `doctor.py` | Error manager: finds problems, fixes the safe ones automatically, reports the rest; crash log and bug reports; retrying wrapper; scheduled watch (see "Error manager" below). `doctor.cmd` runs it with the local `.venv` |
+| `test_doctor.py` | 19 checks for the error manager, each on a real damaged store |
 
 Requirements: Python 3.10+, numpy, `zstandard` (optional; without it only zlib is used), Pillow (optional, for near-duplicate image hashing), `cryptography` (optional, only for `--encrypt`) and `psutil` (optional, only for `monitor.py`).
 
@@ -127,6 +129,66 @@ Other options from the same review: `pack/backup --pack-mb 4` uses 4 MB solid pa
 The store is **50% smaller than `zstd -19 --long`** (43% with parity included) and faster to write, because the three repo copies are hundreds of MB apart in a tar stream (beyond zstd's 128 MiB window) but deduplicate chunk by chunk here. Results: `D:\hcs-real\real_run.json`; per-2-second samples: `D:\hcs-real\pack.csv`.
 
 Lessons from this run (now in TROUBLESHOOTING.md): junctions are stored as links, not followed, so a junction to `node_modules` is not backed up twice; links cannot be restored to exFAT/FAT drives; on NTFS a junction is restored as a junction (no admin or Developer Mode needed; directory symlinks still need one of them). Checking the damaged store first peaked at 3 GiB RAM: damaged block headers carried junk lengths and each was read up to the end of the store before its CRC failed. Block lengths are now checked against the store layout first: peak 572 MiB, same findings.
+
+### Error manager (`doctor.py`)
+
+Watches stores for problems and fixes the ones that cannot lose data, without being asked.
+
+```
+python doctor.py check <store> ... [--password-file F] [--max-age-days 7]   # read-only diagnosis
+python doctor.py fix   <store> ... [--dry-run] [--approve RULE] [--copy-first DIR]
+python doctor.py watch --config doctor.json [--notify]     # all stores in the config; report + status file
+python doctor.py run -- backup <dir> <store>               # backup with automatic recovery
+python doctor.py bugs [--report SIG] [--ack SIG]           # crashes grouped by signature
+python doctor.py rules                                     # every rule and how it is fixed
+python doctor.py schedule --config doctor.json [--install] # daily watch in Task Scheduler
+```
+
+**What it finds.** There are 21 rules (`doctor.py rules`), covering:
+* damage that parity can or cannot rebuild, and damage with no parity;
+* missing footers, interrupted writes, and missing, stale or damaged parity;
+* lost file lists and wrong dedup indexes;
+* leftover `.hcs-new` / `.hcp-new` files;
+* a store being written right now, low disk space, and no snapshot for N days;
+* the same items skipped in each of the last 3 snapshots (with a hint per reason);
+* commands that keep failing, and crashes.
+
+**What it fixes automatically:** only fixes whose result is proven.
+* **Rebuild damaged bytes from parity:** each shard is written only if it hashes to its recorded value. This needs no password.
+* **Footers and interrupted-write tails:** footers are rewritten from the manifest they must point at, and leftover tail bytes are cut off.
+* **Parity:** built or rebuilt only over a store that verifies.
+
+Fixes run in rounds, so a repair can be followed by a parity build. The full repair, which can cut bytes, is held back while any critical damage is open.
+
+**What needs `--approve RULE`:** fixes that remove something, or write to a store whose damage is beyond repair (often a failing disk):
+* deleting leftover temp files;
+* removing a snapshot whose file list is lost;
+* a partial parity rebuild of damage beyond repair. Combine it with `--copy-first DIR`, which copies the store and its parity first.
+
+**Bugs.** Every failed `hybridstore.py` command is appended to an event log: `%LOCALAPPDATA%\hybridstore\events.jsonl`, rotated at 5 MB. `HYBRIDSTORE_LOG=off` turns it off, and it never holds passwords or file contents. Each entry has the exit code and the last error lines.
+* **Crashes** (unexpected exceptions) are also logged, with the traceback and a signature: the exception type plus the functions it went through, without line numbers. Repeats of the same bug are therefore grouped.
+* **`bugs`** lists the groups and matches each against known causes, such as a file held by another program, a full disk, out of memory, a missing privilege, a long path, a failing disk or USB link, or a missing package.
+* **`bugs --report SIG`** writes a Markdown bug report (versions, traceback, read-only checks of the store involved). `--ack SIG` stops `watch` from reporting it.
+* The doctor never edits code.
+
+**`run`** wraps any `hybridstore.py` command and recovers from known transient failures:
+* a locked store, or a file held by another program: waits and retries with backoff (30 s, 60 s, 120 s);
+* a backup refused because a footer is missing: runs `fix`, then retries once;
+* anything else: stops and names the cause.
+
+**`watch`** reads a config such as:
+
+```json
+{"stores": [{"path": "D:\\backup\\projects.hcs"},
+            {"path": "D:\\backup\\docs-enc.hcs", "password_file": "C:\\keys\\docs.txt", "max_age_days": 2}],
+ "max_age_days": 7, "copy_first": null}
+```
+
+It fixes each store, writes `doctor-report.txt` and `doctor-status.json` next to the config, and exits 1 if anything is left. With `--notify` it shows a Windows notification. `schedule` prints the `schtasks` command to run it daily; `--install` registers it.
+
+On the real stores: `check` of the 794 MB store takes 16 s (healthy); the encrypted copy is healthy with its password, and gives `NEEDS_PASSWORD` (parity-only check) without it.
+
+Building it found an engine bug. After an interrupted write, the parity check hashed the extra bytes past the covered end into the last shard. `verify` then reported a damaged shard that was not damaged, and `repair` "rebuilt" it by rewriting the same bytes. Parity now checks only the bytes it covers.
 
 ### Encryption (`--encrypt`)
 

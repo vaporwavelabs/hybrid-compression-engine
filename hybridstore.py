@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import json
 import os
 import re
 import socket
@@ -58,6 +59,7 @@ import struct
 import sys
 import threading
 import time
+import traceback
 import zlib
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -1551,6 +1553,9 @@ class StoreReader:
         hdr = self._read(pos, HDR.size)
         if len(hdr) == HDR.size and hdr[:3] == BLOCK_MAGIC and hdr[3] == CODEC_KEYS:
             _, _, olen, slen, crc = HDR.unpack(hdr)
+            if slen > 1 << 16:          # a key block is ~100 bytes: a larger length is damage
+                raise IntegrityError("the key block of this encrypted store is damaged (`repair` rebuilds it "
+                                     "from parity)")
             payload = self.f.read(slen)
             if len(payload) != slen or olen != slen or zlib.crc32(payload) & 0xFFFFFFFF != crc:
                 raise IntegrityError("the key block of this encrypted store is damaged (`repair` rebuilds it "
@@ -2385,7 +2390,9 @@ class Parity:
             rs, C = self._rec_size(k, m, shard), _cauchy(k, m)
             size = res["size"]
             for sg, base, ng in self._supers(covered, shard, k, depth):
-                arr = self._super_data(sf, base, ng, k, shard, size)
+                # Only the covered bytes: bytes appended after `covered` (an interrupted write) are
+                # not part of any shard, and must not make the last shard look damaged.
+                arr = self._super_data(sf, base, ng, k, shard, min(size, covered))
                 pf.seek(PAR_HDR.size + sg * depth * rs)
                 for j in range(ng):
                     g = sg * depth + j
@@ -3009,13 +3016,104 @@ def main(argv) -> int:
                    help="do not fail on bytes left by an interrupted write / a cut-short store")
     a = ap.parse_args(argv)
     global _prompt_ok
-    saved = (_prompt_ok, _password)
+    saved = (_prompt_ok, _password, sys.stderr)
     _prompt_ok = True
+    tail = sys.stderr = _StderrTail(sys.stderr)
     try:
-        return _main(a)
+        code = _main(a)
+    except Exception as e:      # not a known error: a bug. Record it for `doctor.py bugs`, then fail as before
+        sys.stderr = saved[2]
+        log_event({"kind": "crash", "cmd": a.cmd, "store": _abs(getattr(a, "store", None)),
+                   "error": f"{type(e).__name__}: {e}", "signature": crash_signature(e),
+                   "traceback": "".join(traceback.format_exception(e))[-8000:], "version": _source_version()})
+        print("hybridstore: internal error, recorded in the event log (`python doctor.py bugs` shows it)",
+              file=sys.stderr)
+        raise
     finally:            # main() may be called in-process (tests, other tools): leave no state behind
         _prompt_ok = saved[0]
         set_password(saved[1])
+        sys.stderr = saved[2]
+    if code:
+        log_event({"kind": "error", "cmd": a.cmd, "store": _abs(getattr(a, "store", None)), "exit": code,
+                   "message": tail.text()})
+    return code
+
+
+# --------------------------------------------------------------------------
+# Event log: failed commands and crashes, read by doctor.py (the error manager).
+# One JSON object per line in %LOCALAPPDATA%\hybridstore\events.jsonl (or
+# ~/.local/state/hybridstore/events.jsonl); HYBRIDSTORE_LOG=<file> moves it,
+# HYBRIDSTORE_LOG=off turns it off. Never holds passwords or file contents.
+# --------------------------------------------------------------------------
+EVENT_LOG_ENV = "HYBRIDSTORE_LOG"
+EVENT_LOG_MAX = 5 << 20                 # rotated to events.jsonl.1 beyond this
+
+
+def event_log_path() -> str | None:
+    p = os.environ.get(EVENT_LOG_ENV)
+    if p is not None:
+        return None if p.strip().lower() in ("", "off", "0", "none") else p
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "hybridstore", "events.jsonl")
+
+
+def log_event(ev: dict) -> None:
+    """Append one event; never raises (logging must not break a backup)."""
+    p = event_log_path()
+    if not p:
+        return
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
+        if os.path.exists(p) and os.path.getsize(p) > EVENT_LOG_MAX:
+            os.replace(p, p + ".1")
+        line = json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "pid": os.getpid(), **ev},
+                          ensure_ascii=False, default=str)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def crash_signature(e: BaseException) -> str:
+    """Same bug, same signature: the exception type plus the functions of this
+    project it passed through (no line numbers, so it survives small edits)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    frames = [f"{os.path.basename(fr.filename)}:{fr.name}" for fr in traceback.extract_tb(e.__traceback__)
+              if os.path.dirname(os.path.abspath(fr.filename)) == here]
+    return hashlib.sha1(f"{type(e).__name__}|{'|'.join(frames[-6:])}".encode()).hexdigest()[:12]
+
+
+def _abs(p: str | None) -> str | None:
+    return os.path.abspath(p) if p else None
+
+
+def _source_version() -> str:
+    try:
+        with open(__file__, "rb") as f:
+            return hashlib.sha1(f.read()).hexdigest()[:10]
+    except OSError:
+        return "?"
+
+
+class _StderrTail:
+    """Passes stderr through and keeps its last few KB for the event log."""
+
+    def __init__(self, inner, keep: int = 4000):
+        self._inner, self._keep, self._buf = inner, keep, ""
+
+    def write(self, s):
+        self._buf = (self._buf + s)[-self._keep:]
+        return self._inner.write(s) if self._inner else len(s)
+
+    def flush(self):
+        if self._inner:
+            self._inner.flush()
+
+    def text(self) -> str:
+        return self._buf.strip()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
 
 def _main(a) -> int:
