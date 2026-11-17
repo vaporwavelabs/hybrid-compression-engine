@@ -45,8 +45,9 @@ Symlinks and junctions are stored as links (their target path), not followed, th
 
 | Restore target | Result |
 |---|---|
-| NTFS with Developer Mode or as admin | links are created (a junction comes back as a directory symlink to the same absolute target) |
-| NTFS, no Developer Mode, not admin | "symlink … not created (A required privilege is not held)", exit 3: turn on Developer Mode, or run as admin |
+| NTFS | junctions come back as junctions to the same absolute target; no privilege needed |
+| NTFS with Developer Mode or as admin | symlinks are created too |
+| NTFS, no Developer Mode, not admin | junctions are fine; a symlink gives "symlink … not created (A required privilege is not held)", exit 3: turn on Developer Mode, or run as admin |
 | exFAT / FAT32 (most USB disks and SD cards) | "symlink … not created (Incorrect function)", exit 3: these filesystems have no links. Restore to an NTFS drive if the links matter; every regular file is restored either way |
 
 When you compare a restore with the source yourself, do not follow junctions (`os.walk` and Python's `tarfile` do follow them on Windows); `real_run.py` shows how.

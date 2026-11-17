@@ -1129,6 +1129,56 @@ def _():
         ctypes.windll.kernel32.SetFileAttributesW(p, 0x80)
 
 
+@check("a damaged block length is caught from the layout, without reading the rest of the store")
+def _():
+    src = os.path.join(TMP, "blen")
+    tree(src, {f"f{i}.bin": os.urandom(300_000) for i in range(6)})
+    store = os.path.join(TMP, "blen.hcs")
+    w = hs.StoreWriter(store, pack_target=1 << 16, parity=False); w.add_tree(src); w.close()
+    with hs.StoreReader(store) as r:
+        off = r.pack_offsets[1]
+    with open(store, "r+b") as f:                    # set the stored-length field of pack 1 to ~4 GB
+        f.seek(off + 8); f.write(b"\xf0\xff\xff\xff")   # header: magic 3, flags 1, orig_len 4, stored_len 4, crc 4
+    with hs.StoreReader(store) as r:
+        rep = r.scan()
+        assert 1 in rep["bad_packs"] and "does not match the store layout" in rep["bad_packs"][1], rep["bad_packs"]
+        assert len(rep["bad_packs"]) == 1, rep["bad_packs"]
+
+
+@check("Windows junctions are restored as junctions, directory symlinks as symlinks")
+def _():
+    if os.name != "nt":
+        return
+    import _winapi
+    src, outside = os.path.join(TMP, "jsrc"), os.path.join(TMP, "joutside")
+    tree(src, {"real/x.txt": b"inside"})
+    tree(outside, {"y.txt": b"outside"})
+    _winapi.CreateJunction(os.path.join(src, "real"), os.path.join(src, "j_in"))
+    _winapi.CreateJunction(outside, os.path.join(src, "j_out"))
+    try:
+        os.symlink(outside, os.path.join(src, "dirsym"), target_is_directory=True); sym = True
+    except OSError:
+        sym = False                                  # no Developer Mode / admin
+    store = os.path.join(TMP, "junc.hcs")
+    w = hs.StoreWriter(store); w.add_tree(src); st = w.close()
+    assert st.links == 2 + sym and st.files == 1, st     # the links' contents are not stored twice
+    out = os.path.join(TMP, "junc_out")
+    for k in range(2):                               # the second restore replaces the existing links
+        with hs.StoreReader(store) as r:
+            assert r.unpack(out, overwrite=bool(k)) == []
+    for name, target in (("j_in", os.path.join(src, "real")), ("j_out", outside)):
+        p = os.path.join(out, name)
+        assert os.path.isjunction(p) and not os.path.islink(p), name
+        assert os.path.normcase(os.readlink(p).removeprefix("\\\\?\\")) == os.path.normcase(target), os.readlink(p)
+    assert open(os.path.join(out, "j_out", "y.txt"), "rb").read() == b"outside"
+    if sym:
+        assert os.path.islink(os.path.join(out, "dirsym")) and not os.path.isjunction(os.path.join(out, "dirsym"))
+    for base in (src, out):                          # remove the links before rmtree can follow them
+        for name in ("j_in", "j_out", "dirsym"):
+            if os.path.lexists(os.path.join(base, name)):
+                os.rmdir(os.path.join(base, name))  # removes the link only, not its target
+
+
 if __name__ == "__main__":
     shutil.rmtree(TMP, ignore_errors=True)
     print(f"\nall {len(passed)} checks passed")

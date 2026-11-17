@@ -880,6 +880,23 @@ def _is_link(path: str) -> bool:
     return os.path.islink(path) or (hasattr(os.path, "isjunction") and os.path.isjunction(path))
 
 
+def _make_junction(target: str, dest: str, e: "FileEntry") -> bool:
+    """Recreate a Windows junction as a junction. A junction is stored as a
+    directory link whose recorded st_mode is a directory (a real symlink has
+    S_IFLNK), so stores written before this need no change. Junctions need no
+    privilege or Developer Mode, unlike symlinks. False (caller makes a
+    symlink instead) if this entry is not a junction or the target cannot be
+    a junction target (relative or a network path)."""
+    if os.name != "nt" or e.kind != KIND_DIRLINK or not stat.S_ISDIR(e.mode):
+        return False
+    t = target[4:] if target.startswith("\\\\?\\") else target
+    if t.upper().startswith("UNC\\") or not os.path.isabs(t) or t[1:2] != ":":
+        return False
+    import _winapi
+    _winapi.CreateJunction(t, dest)
+    return True
+
+
 def _set_win_attrs(path: str, attrs: int):
     import ctypes
     ctypes.windll.kernel32.SetFileAttributesW(path, (attrs & WIN_ATTR_KEEP) or WIN_ATTR_NORMAL)
@@ -1560,10 +1577,16 @@ class StoreReader:
             chain = self._chain_by_walking(load_index, e)
         self.snapshots: list[Snapshot] = chain
         self.pack_offsets: list[int] = []
+        # Where each pack must end: the next pack of its snapshot, or that
+        # snapshot's manifest. A damaged length field in a block header then
+        # fails at once instead of making the reader allocate up to the rest
+        # of the store before the CRC rejects it.
+        self.pack_ends: list[int] = []
         for s in chain:
             if s.first_pack != len(self.pack_offsets):
                 raise IntegrityError(f"pack ids out of order in snapshot at {s.offset}")
             self.pack_offsets.extend(s.packs)
+            self.pack_ends.extend(list(s.packs[1:]) + [s.offset] if s.packs else [])
         self.entries = chain[-1].entries        # newest snapshot (v1 API)
         self._cache: OrderedDict[int, list[bytes]] = OrderedDict()
         self._cache_max = cache_bytes           # decoded-pack cache budget
@@ -1689,11 +1712,19 @@ class StoreReader:
         self.f.seek(off)
         return self.f.read(n)
 
-    def _block(self, off: int) -> tuple[bytes, int, int]:
+    def _block(self, off: int, end: int | None = None) -> tuple[bytes, int, int]:
+        """The block at off. end, when known from the store layout, is where it
+        must finish; the length in a damaged header is caught before reading."""
         hdr = self._read(off, HDR.size)
         if len(hdr) != HDR.size:
             raise IntegrityError(f"truncated header at {off}")
         slen = HDR.unpack(hdr)[3]
+        if end is not None and off + HDR.size + slen != end:
+            raise IntegrityError(f"block header at {off} is damaged: its length ({slen:,}) does not match "
+                                 f"the store layout ({end - off - HDR.size:,})")
+        if off + HDR.size + slen > self.file_size:
+            raise IntegrityError(f"block header at {off} is damaged: its length ({slen:,}) runs past the "
+                                 f"end of the store")
         payload = self.f.read(slen)
         data, flags = self.codec.decode_block(hdr, payload, off)
         return data, flags, off + HDR.size + slen
@@ -1810,7 +1841,7 @@ class StoreReader:
             return pack
         if pid >= len(self.pack_offsets):
             raise IntegrityError(f"pointer to missing pack {pid}")
-        pack = _decode_pack(self._block(self.pack_offsets[pid])[0])
+        pack = _decode_pack(self._block(self.pack_offsets[pid], self.pack_ends[pid])[0])
         self._cache[pid] = pack
         self._cache_used += sum(map(len, pack)) + 64 * len(pack)
         while self._cache_used > self._cache_max and len(self._cache) > 1:
@@ -1931,7 +1962,8 @@ class StoreReader:
                 elif os.path.lexists(dest):
                     _make_writable(dest)
                     os.remove(dest)
-                os.symlink(target, dest, target_is_directory=e.kind == KIND_DIRLINK)
+                if not _make_junction(target, dest, e):
+                    os.symlink(target, dest, target_is_directory=e.kind == KIND_DIRLINK)
             except OSError as ex:
                 warnings.append(f"{e.path}: symlink -> {target} not created ({ex.strerror or ex})")
         for dest, e in sorted(dirs, key=lambda d: d[1].path.count("/"), reverse=True):

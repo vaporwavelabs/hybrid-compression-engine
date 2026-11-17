@@ -143,6 +143,14 @@ u32 n | n × u64 chunk pointer   content = chunks concatenated
   * A directory has no content (size 0, sha256 of the empty string, no pointers).
   * A symlink's content is its target path in utf-8, with `surrogateescape`
     used for non-UTF-8 bytes on POSIX.
+  * A Windows junction is kind 3 with a directory `st_mode` (`S_IFDIR`); a
+    real directory symlink has `S_IFLNK`. Readers on Windows recreate a
+    junction as a junction (no privilege needed) when its target is an
+    absolute drive path, otherwise as a directory symlink.
+* **Block lengths:** packs of a snapshot are contiguous and followed by its
+  manifest, so each pack's end is known from the footer chain. A reader
+  must reject a block whose header length disagrees with that end, or runs
+  past the end of the file, before reading its payload.
 * **Order:** entries are in walk order, with each directory before the things
   inside it.
 * **Skipped** (items that could not be read during this backup and are not in
