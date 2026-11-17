@@ -17,7 +17,7 @@ It lists five Phase I bugs and Phase II fixes: a naive XOR boundary test (fix: a
 | `hybridstore.py` | The engine and CLI (commands below) |
 | `bench.py` | Builds the sample datasets, checks round trips, runs an incremental-backup run and the corruption test, compares against baselines |
 | `bench_large.py` | Packs, verifies and restores one large file (default 2 GiB) and reports peak memory |
-| `test_hybridstore.py` | 42 checks (`HS_TEST_ONLY=encrypt,parity` runs a subset): streaming, snapshots, v1 compatibility, crash recovery, path safety, large media, locking, skipped files, strict verify, decompression bombs, metadata, unchanged-file reuse, prune (copy/repack/dictionary, policies, dry run, refusals), and the safeguards (damaged footers and manifests, `pack`/`unpack` refusals, files changing while read, full damage reports), Reed-Solomon parity (incremental = full rebuild, bit-exact repair of packs/manifests/footers/header, refusal beyond capacity, stale or damaged sidecar), interleaved parity (2 MiB bursts, `--m 4`), encryption (no plaintext on disk, wrong password vs damage, padding, CLI, MCP), `repair --dry-run`, cloud placeholders, damaged block lengths, Windows junctions, `--pack-mb` / `--fsync` |
+| `test_hybridstore.py` | 46 checks (`HS_TEST_ONLY=encrypt,parity` runs a subset): streaming, snapshots, v1 compatibility, crash recovery, path safety, large media, locking, skipped files, strict verify, decompression bombs, metadata, unchanged-file reuse, prune (copy/repack/dictionary, policies, dry run, refusals), and the safeguards (damaged footers and manifests, `pack`/`unpack` refusals, files changing while read, full damage reports), Reed-Solomon parity (incremental = full rebuild, bit-exact repair of packs/manifests/footers/header, refusal beyond capacity, stale or damaged sidecar), interleaved parity (2 MiB bursts, `--m 4`), encryption (no plaintext on disk, wrong password vs damage, padding, CLI, MCP), `repair --dry-run`, cloud placeholders, damaged block lengths, Windows junctions, `--pack-mb` / `--fsync` |
 | `FORMAT.md` | Byte-level specification of the store format |
 | `hybridstore.cmd` | Windows launcher that uses the local `.venv` |
 | `hybridstore_mcp.py` | Read-only MCP server: lets an LLM list, read, search and diff snapshots without unpacking (see below) |
@@ -42,7 +42,7 @@ Requirements: Python 3.10+, numpy, `zstandard` (optional; without it only zlib i
 
 ```
 python hybridstore.py pack   <input_dir> <store> [--level N] [--workers N] [--force]  # new store; --force to replace one
-python hybridstore.py backup <input_dir> <store> [--level N] [--workers N] [--rehash]  # add a snapshot; creates the store if missing
+python hybridstore.py backup <input_dir> <store> [--level N] [--workers N] [--rehash] [--no-precheck]  # add a snapshot; creates the store if missing
 python hybridstore.py list   <store> [--skipped]                 # show snapshots (and what each could not read)
 python hybridstore.py unpack <store> <output_dir> [--snapshot N] [--force]  # default: newest; --force replaces existing files
 python hybridstore.py verify <store> [--allow-partial]           # check everything; lists ALL damage and affected files
@@ -58,9 +58,9 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | 0 | OK |
-| 1 | Integrity error, or `verify` found damage or a cut-short store |
+| 1 | Integrity error, or `verify` found damage or a cut-short store, or `backup` refused because the existing store is damaged (nothing written) |
 | 2 | Refused because it would destroy data: `pack` onto an existing store, or `unpack` over existing files (use `--force`) |
-| 3 | Finished with warnings: `backup`/`pack` skipped unreadable items or stored files that kept changing while read, or `unpack` could not create some symlinks |
+| 3 | Finished with warnings: `backup`/`pack` skipped unreadable items or stored files that kept changing while read, `backup` rebuilt damaged bytes from parity before writing, or `unpack` could not create some symlinks |
 | 4 | Another backup is writing to the store |
 | 5 | The store is encrypted and no password, or the wrong one, was given |
 
@@ -81,6 +81,15 @@ A review damaged a scratch store on purpose. Detection was already complete, but
 | A damaged older footer | `verify` failed with no fix | `repair` rewrites it in place |
 
 Deduplication keeps one copy of each chunk, so without parity one bad byte loses every file with data in that 1 MiB pack, in every snapshot that uses it. That is what the parity sidecar below is for.
+
+### Checks before and after every backup
+
+A new snapshot stores only what is new and points at existing chunks for the rest, so damage already in the store would silently become part of it. `backup` therefore proves the store before it writes anything, and proves its own writes before it publishes them:
+
+1. **Before writing (precheck).** Under the store lock, every 64 KiB shard is hashed against its parity record. Damage that parity can rebuild is rebuilt, each shard written only if it matches its recorded hash; the backup then goes ahead and exits 3 with a warning, because damage that appears on its own can mean a failing disk. Bytes the parity does not cover, or the whole store when there is no parity, are checked by decoding every pack (CRC, or authentication when encrypted). The layout and every snapshot's file list are checked too. If any damage is left, the backup is refused (exit 1) and nothing is written, not even a repair. `doctor.py fix` then says what can be done.
+2. **Before publishing (read-back).** After the new packs and the file list are written and flushed, every new block is read back from the file, decoded, and each new chunk is checked against the SHA-256 it was indexed under. Only then is the footer written that makes the snapshot visible. If anything differs, the run is rolled back and the store is exactly as before. This catches a bad encode, a short or misplaced write, and RAM or USB-controller errors. A freshly written block can come back from the OS cache rather than the disk; the next backup's precheck reads it from the disk.
+
+The precheck reads the whole store once: on the 796 MB real-run store it took 1.5 s with parity and 2.2 s without, both from the Windows file cache. From a USB hard disk with nothing cached, expect about 7 s per GB. `backup --no-precheck` skips it (a warning says so); the read-back cannot be turned off.
 
 ### Reed-Solomon parity (`<store>.hcp`)
 

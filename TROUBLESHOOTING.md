@@ -14,6 +14,14 @@ Each entry gives the symptom, what it means, and what to do, safest step first. 
 | "… or the parity does not match the store", or parity covers fewer bytes than the store | the sidecar is older than the store (a backup that did not finish its parity step, or a store copied without its `.hcp`) | if the store verifies, `parity <store>` rebuilds it. If the store does not verify, do **not** rebuild parity: that would bake the damage in. Look for a matching `.hcp` first |
 | damage keeps coming back after `repair`, or in different places each run | the disk, cable, controller or RAM is corrupting data as it is read or written | check the disk (section 6) and RAM (Windows Memory Diagnostic or MemTest86) before trusting any repair |
 
+`backup` runs the same check before it writes (README, "Checks before and after every backup"):
+
+| What `backup` says | What it means | What to do |
+|---|---|---|
+| "warning: checked before writing: REBUILT n damaged shard(s)", exit 3 | the store had damage parity could prove and rebuild; the backup then went ahead | nothing for the store. Damage that appears on its own is the disk's doing: run section 6 checks, and watch whether it happens again |
+| "the check before writing found damage … Nothing was written", exit 1 | damage parity cannot rebuild, or (no parity) a pack fails its CRC. A new snapshot would reuse that data, so it was refused | `python doctor.py fix <store>` for the plan; copy the store off the disk first if it may be failing. `--no-precheck` writes anyway, but the new snapshot may then depend on the damage |
+| "read-back check failed … NOT published", exit 1 | what was read back from the disk differs from what was written. The store is exactly as before | run the backup again. If it fails again, suspect RAM, the cable / USB enclosure or the disk (section 6) |
+
 Why repair is safe to try: every shard's BLAKE2b is stored in the sidecar, so a rebuilt shard is written only if it hashes to the value recorded when the store was good. A stale or wrong sidecar can refuse to repair; it cannot "repair" the store into something else. Other tools learned this the hard way: `borg check --repair` and `restic repair` warn that repair can remove data that is merely unreadable now, which is why they ask for a backup copy first [1][2]. Here `repair` changes nothing it cannot prove, and `--dry-run` shows what it would do.
 
 ## 2. Wrong password, lost password, encrypted stores

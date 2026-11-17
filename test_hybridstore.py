@@ -570,7 +570,8 @@ def _():
         with hs.StoreReader(store) as r:
             assert len(r.snapshots) == 2 and r.tail_snapshot is not None, how
         try:
-            hs.StoreWriter(store, append=True)
+            # precheck=False: with parity the precheck would rebuild the footer first (tested below)
+            hs.StoreWriter(store, append=True, precheck=False)
             raise AssertionError("backup accepted a store whose newest snapshot lost its footer")
         except hs.IntegrityError as e:
             assert "repair" in str(e)
@@ -744,7 +745,8 @@ def _():
         hs.prune(store, [1]); raise AssertionError("prune kept a damaged snapshot")
     except ValueError as e:
         assert "[2]" in str(e)
-    w = hs.StoreWriter(store, append=True); w.add_tree(src); w.close()      # backups keep working
+    # backups keep working (precheck=False: by default the precheck would rebuild the manifest from parity)
+    w = hs.StoreWriter(store, append=True, precheck=False); w.add_tree(src); w.close()
     with hs.StoreReader(store) as r:
         assert r.damaged == [2] and len(r.snapshots) == 4
     ps = hs.prune(store, [2])
@@ -855,7 +857,8 @@ def _():
     good = open(store, "rb").read()
     _flip(store, len(good) - 40_000)
     tree(src, {"later.bin": os.urandom(100_000)})
-    w = hs.StoreWriter(store, append=True); w.add_tree(src); st = w.close()
+    # precheck=False reaches the update's own guard (by default the precheck rebuilds the bytes first)
+    w = hs.StoreWriter(store, append=True, precheck=False); w.add_tree(src); st = w.close()
     assert st.parity.startswith("warning") and "repair" in st.parity, st.parity
     hs.repair(store)
     assert open(store, "rb").read()[:len(good)] == good
@@ -1178,6 +1181,90 @@ def _():
         for name in ("j_in", "j_out", "dirsym"):
             if os.path.lexists(os.path.join(base, name)):
                 os.rmdir(os.path.join(base, name))  # removes the link only, not its target
+
+
+def _pre_store(name, parity):
+    src = os.path.join(TMP, name)
+    store = os.path.join(TMP, name + ".hcs")
+    tree(src, {f"f{i}.bin": os.urandom(120_000) for i in range(5)})       # ~600 KB: one parity group
+    w = hs.StoreWriter(store, pack_target=1 << 16, parity=parity); w.add_tree(src); w.close()
+    tree(src, {"new.bin": os.urandom(50_000)})
+    return src, store
+
+
+@check("backup first proves the store: damage parity can rebuild is rebuilt, then the snapshot is written")
+def _():
+    src, store = _pre_store("pre_fix", None)
+    with hs.StoreReader(store) as r:
+        off = r.pack_offsets[2] + 500
+    _flip(store, off)
+    code, out = _quiet("backup", src, store)
+    assert code == 3 and "REBUILT 1 damaged" in out and "checked before writing" in out, (code, out)
+    assert "read back and proved" in out, out
+    with hs.StoreReader(store) as r:
+        assert len(r.snapshots) == 2 and r.verify() == 5 + 6
+    code, out = _quiet("backup", src, store)              # clean store: proven, nothing rebuilt, exit 0
+    assert code == 0 and "proven against parity" in out and "REBUILT" not in out, (code, out)
+
+
+@check("backup refuses, changing nothing, when the store has damage parity cannot rebuild")
+def _():
+    src, store = _pre_store("pre_beyond", None)
+    for off in (70_000, 140_000, 210_000):               # 3 shards of the one group; parity rebuilds 2
+        _flip(store, off)
+    before, pbefore = open(store, "rb").read(), open(store + ".hcp", "rb").read()
+    code, out = _quiet("backup", src, store)
+    assert code == 1 and "check before writing found damage" in out and "Nothing was written" in out, (code, out)
+    assert open(store, "rb").read() == before and open(store + ".hcp", "rb").read() == pbefore
+    hs._StoreLock(store).release()                      # the refused run released the lock
+
+
+@check("without parity, backup decodes every pack first and refuses on a damaged one; --no-precheck skips")
+def _():
+    src, store = _pre_store("pre_nopar", False)
+    code, out = _quiet("backup", src, store)
+    assert code == 0 and "every pack decoded" in out, (code, out)
+    with hs.StoreReader(store) as r:
+        off, n = r.pack_offsets[1] + 300, len(r.snapshots)
+    _flip(store, off)
+    before = open(store, "rb").read()
+    code, out = _quiet("backup", src, store)
+    assert code == 1 and "pack 1 (snapshot 1) is damaged" in out, (code, out)
+    assert open(store, "rb").read() == before
+    code, out = _quiet("backup", "--no-precheck", src, store)
+    assert code == 0 and "was not checked before writing" in out, (code, out)
+    with hs.StoreReader(store) as r:
+        assert len(r.snapshots) == n + 1
+
+
+@check("every new block is read back and proven before the footer; a bad write is rolled back")
+def _():
+    src, store = _pre_store("readback", None)
+    tree(src, {"more.bin": os.urandom(200_000)})
+    good = open(store, "rb").read()
+    for append in (True, False):
+        target = store if append else os.path.join(TMP, "readback_new.hcs")
+        w = hs.StoreWriter(target, append=append, workers=1, pack_target=1 << 16)
+        real = w.codec.encode
+
+        def bad(data, flags=0, real=real):
+            out, info = real(data, flags)
+            if flags & hs.FLAG_MANIFEST:
+                return out, info
+            return out[:-1] + bytes([out[-1] ^ 1]), info     # one bit lost between RAM and disk
+        w.codec.encode = bad
+        w.add_tree(src)
+        try:
+            w.close()
+            raise AssertionError("a corrupted pack was published")
+        except hs.IntegrityError as e:
+            assert "read-back check failed" in str(e) and "NOT published" in str(e), e
+        if append:
+            assert open(store, "rb").read() == good, "the rolled-back backup changed the store"
+        else:
+            assert not os.path.exists(target) and not os.path.exists(target + ".hcs-new")
+    with hs.StoreReader(store) as r:
+        assert len(r.snapshots) == 1 and r.verify() == 5
 
 
 if __name__ == "__main__":

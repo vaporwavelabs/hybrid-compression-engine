@@ -317,13 +317,24 @@ def _():
 @check("run: a backup refused for a missing footer is repaired and retried")
 def _():
     src, store = make_store("runfooter", snapshots=2)
+    good = open(store, "rb").read()
     with open(store, "r+b") as f:
-        f.truncate(os.path.getsize(store) - hs.FOOTER.size)
-    rc, out = quiet(doctor.run, ["backup", src, store], retries=2, wait=0.1)
+        f.truncate(len(good) - hs.FOOTER.size)
+    # --no-precheck: reach the engine's refusal, so doctor's own repair-and-retry is what fixes it
+    rc, out = quiet(doctor.run, ["backup", "--no-precheck", src, store], retries=2, wait=0.1)
     assert rc == 0, out
     with hs.StoreReader(store) as r:
         assert len(r.snapshots) == 3                 # both old ones visible again, plus the new one
         assert not r.scan()["problems"]
+    # By default the backup's own precheck rebuilds the lost footer from parity (exit 3: a warning)
+    open(store, "wb").write(good)
+    hs.Parity(store).build()
+    with open(store, "r+b") as f:
+        f.truncate(len(good) - hs.FOOTER.size)
+    rc, out = quiet(doctor.run, ["backup", src, store], retries=2, wait=0.1)
+    assert rc == 3 and "REBUILT" in out, (rc, out)
+    with hs.StoreReader(store) as r:
+        assert len(r.snapshots) == 3 and not r.scan()["problems"]
 
 
 @check("run: an unrecoverable error is not retried and its cause is named")

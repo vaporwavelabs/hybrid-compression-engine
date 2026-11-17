@@ -817,6 +817,9 @@ class Stats:
     skipped: list = field(default_factory=list)   # (path, reason) of files that could not be read
     changed: list = field(default_factory=list)   # paths still changing after a re-read (stored anyway)
     parity: str = ""            # "built" / "updated" / "" (none) / "warning: ..."
+    precheck: str = ""          # what the check of the existing store before writing found / did
+    precheck_fixed: bool = False    # it rebuilt damaged bytes from parity (a disk worth watching)
+    readback: int = 0           # new blocks read back and proven before the snapshot was published
 
 
 def _encode_pack(chunks: list[bytes]) -> bytes:
@@ -944,7 +947,8 @@ class StoreWriter:
                  pack_target: int = 1 << 20, near_dup_hamming: int = 6,
                  append: bool = False, label: str = "", workers: int | None = None,
                  max_pending_bytes: int = 256 << 20, parity: bool | None = None,
-                 encrypt: bool = False, password: str | None = None, cloud_files: bool = False):
+                 encrypt: bool = False, password: str | None = None, cloud_files: bool = False,
+                 precheck: bool = True):
         """workers: threads for reading/chunking small files, hashing large
         ones and compressing packs (default: CPU count, max 16; 1 = no
         threads). Output is byte-identical whatever the worker count, except
@@ -963,8 +967,19 @@ class StoreWriter:
         encrypt: seal every block of a NEW store with a random key, itself
         sealed under the password (argument, set_password(), or the
         HYBRIDSTORE_PASSWORD environment variable). Appending to an encrypted
-        store needs the same password and always stays encrypted."""
+        store needs the same password and always stays encrypted.
+
+        precheck (append only): before anything is written, prove the
+        existing store intact, because a new snapshot reuses (dedups against)
+        its data. With parity, every shard is hashed against its record and
+        damage parity can rebuild is rebuilt (hash-proven); without parity
+        (or where it does not reach), every pack is decoded and CRC-checked.
+        Any damage that remains refuses the backup (IntegrityError) and
+        changes nothing. Independently of this, close() always reads back
+        every block the run wrote and proves each new chunk against its
+        SHA-256 before the footer publishes the snapshot."""
         self.parity_mode = parity
+        self.precheck = precheck
         self.encrypt, self.password = encrypt, password
         self.cloud_files = cloud_files          # False: skip (and report) cloud placeholders
         self.lock = _StoreLock(path)
@@ -993,6 +1008,9 @@ class StoreWriter:
         self.prev_snapshots: list[Snapshot] = []
         self.recovered_bytes = 0               # tail bytes dropped from an interrupted write
         if append and os.path.exists(path) and os.path.getsize(path) > 0:
+            proven = 0
+            if self.precheck:          # before opening: a rebuilt manifest may be what opening needs
+                proven = _precheck_parity(path, self.stats)
             with StoreReader(path, codec=self.codec, load_index=True, password=self.password) as r:
                 if self.encrypt and not r.encrypted:
                     raise IntegrityError(f"{path} is not encrypted; encryption is chosen when a store is "
@@ -1002,6 +1020,8 @@ class StoreWriter:
                         f"{path}: the newest snapshot (#{len(r.snapshots) + 1}) is complete but its footer "
                         f"is damaged or missing, so it is not visible. Nothing was changed. Run "
                         f"`hybridstore.py repair {path}` to restore it, then back up again")
+                if self.precheck:
+                    _precheck_blocks(r, proven, self.stats)
                 self.pack_offsets = list(r.pack_offsets)
                 self.index = r.index
                 self.prev_manifest = r.snapshots[-1].offset
@@ -1468,6 +1488,7 @@ class StoreWriter:
         # Make sure packs + manifest are on disk before the footer that
         # publishes them; a crash before this point leaves the old footer valid.
         self.f.flush(); os.fsync(self.f.fileno())
+        self._read_back(moff)                  # raises -> close() rolls the run back; nothing is published
         self.f.write(FOOTER.pack(moff, STORE_MAGIC))
         self.pos += FOOTER.size
         self.f.flush(); os.fsync(self.f.fileno())
@@ -1485,6 +1506,44 @@ class StoreWriter:
         self.stats.store_bytes = self.pos
         self.stats.added_bytes = self.pos - self.start + (len(STORE_MAGIC) if self.created else 0)
         return self.stats
+
+    def _read_back(self, moff: int):
+        """Read every block this run wrote back from the file, decode it
+        (CRC / authentication) and prove each new chunk against the SHA-256 it
+        was indexed under, before the footer publishes the snapshot. Catches a
+        bad encode, a short or misplaced write, and RAM or controller errors on
+        the way to the disk. (A freshly written block may come back from the OS
+        cache rather than the platter; the next backup's precheck reads it
+        from disk.)"""
+        want: dict[int, list] = {}
+        for d, p in self.new_index:
+            want.setdefault(p >> PTR_SHIFT, []).append((p & PTR_IDX_MASK, d))
+        offs = self.pack_offsets[self.first_new_pack:] + [moff]
+        ends = offs[1:] + [self.pos]
+        with open(self.f.name, "rb") as f:
+            for i, (off, end) in enumerate(zip(offs, ends)):
+                pid = self.first_new_pack + i
+                what = "the new file list (manifest)" if off == moff else f"new pack {pid}"
+                f.seek(off)
+                raw = f.read(end - off)
+                try:
+                    data, _, nxt = self.codec.decode_at(raw, 0)
+                    if nxt != len(raw):
+                        raise IntegrityError("its length does not match what was written")
+                    if off != moff:
+                        chunks = _decode_pack(data)
+                        for idx, d in want.pop(pid, ()):
+                            if idx >= len(chunks) or hashlib.sha256(chunks[idx]).digest() != d:
+                                raise IntegrityError(f"chunk {idx} does not match the data that was read")
+                except IntegrityError as e:
+                    raise IntegrityError(f"read-back check failed: {what} at byte {off:,} is not what was "
+                                         f"written ({e}). The snapshot was NOT published and the store is "
+                                         f"unchanged. Repeated failures point at RAM, the cable / USB "
+                                         f"enclosure or the disk") from None
+                self.stats.readback += 1
+        if want:
+            raise IntegrityError(f"read-back check failed: chunks indexed in pack(s) {sorted(want)[:5]} were "
+                                 f"never written. The snapshot was NOT published and the store is unchanged")
 
     def _update_parity(self) -> str:
         """Bring the parity sidecar up to date (under the store lock). A
@@ -2455,6 +2514,76 @@ def parity_summary(c: dict) -> str:
     return "; ".join(parts)
 
 
+def _refuse_damaged(path: str, problems: list[str]) -> IntegrityError:
+    more = f" (and {len(problems) - 1} more problem(s))" if len(problems) > 1 else ""
+    return IntegrityError(
+        f"{path}: the check before writing found damage in the existing store: {problems[0]}{more}. "
+        f"Nothing was written: a new snapshot reuses existing data, so it would depend on the damage. "
+        f"`hybridstore.py verify {path}` lists what is affected and `python doctor.py fix {path}` says what "
+        f"can be done (copy the store elsewhere first if the disk may be failing). `backup --no-precheck` "
+        f"skips this check")
+
+
+def _precheck_parity(path: str, stats: "Stats") -> int:
+    """First half of the pre-write check (caller holds the store lock): hash
+    every shard against the parity records. Damage parity can rebuild is
+    rebuilt, each shard proven against its recorded hash; damage it cannot
+    rebuild refuses the write before any byte is changed. Returns how far
+    (store bytes) the store is now proven intact; 0 = parity proved nothing
+    and every pack must be checked by decoding it."""
+    par = Parity(path)
+    if not par.exists():
+        stats.precheck = "no parity: every pack decoded and CRC-checked"
+        return 0
+    c = par.check()
+    if not c["header_ok"]:
+        stats.precheck = f"parity unusable ({c.get('error', 'unreadable')}): every pack decoded and CRC-checked"
+        return 0
+    if c["unrepairable_groups"]:
+        raise _refuse_damaged(path, [f"{c['bad_shards']} damaged {PARITY_SHARD >> 10} KiB shard(s), "
+                                     f"{len(c['unrepairable_groups'])} group(s) beyond what parity can rebuild"])
+    if c["bad_shards"]:
+        c = par.check(fix=True)
+        stats.precheck_fixed = True
+        stats.precheck = (f"REBUILT {c['repaired_shards']} damaged {PARITY_SHARD >> 10} KiB shard(s) from parity "
+                          f"before writing (each proven against its recorded hash). Damage that appears on its "
+                          f"own can mean a failing disk")
+    else:
+        stats.precheck = f"all {c['covered']:,} bytes proven against parity"
+    if c["bad_records"]:
+        stats.precheck += (f"; {len(c['bad_records'])} parity record(s) damaged, so every pack was also "
+                           f"decoded and CRC-checked")
+        return 0
+    return c["covered"]
+
+
+def _precheck_blocks(r: "StoreReader", proven: int, stats: "Stats"):
+    """Second half: the byte layout, every snapshot's file list, and every
+    pack not already proven by parity (decoded, CRC / authentication checked)."""
+    problems = []
+    try:
+        r.check_layout()
+    except IntegrityError as e:
+        problems.append(str(e))
+    decoded = 0
+    for num, s in enumerate(r.snapshots, 1):
+        if s.damaged:
+            problems.append(f"snapshot {num}: {s.damaged}")
+        for k in range(len(s.packs)):
+            pid = s.first_pack + k
+            if r.pack_ends[pid] <= proven:
+                continue
+            try:
+                r._pack(pid)
+                decoded += 1
+            except IntegrityError as e:
+                problems.append(f"pack {pid} (snapshot {num}) is damaged: {e}")
+    if problems:
+        raise _refuse_damaged(r.f.name, problems)
+    if proven and decoded:
+        stats.precheck += f"; {decoded} pack(s) past the parity decoded and CRC-checked"
+
+
 def repair(path: str, dry_run: bool = False) -> list[str]:
     """Fix what can be fixed without losing anything, under the store lock:
 
@@ -2832,14 +2961,19 @@ def _fmt(st: Stats) -> str:
 
 def _write(store: str, src: str, append: bool, level: int = 19, workers: int | None = None,
            rehash: bool = False, parity: bool | None = None, pack_mb: float = 1,
-           encrypt: bool = False, cloud_files: bool = False) -> int:
+           encrypt: bool = False, cloud_files: bool = False, precheck: bool = True) -> int:
     if not os.path.isdir(src):
         print(f"error: {src} is not a directory", file=sys.stderr)
         return 2
     t0 = time.time()
     w = StoreWriter(store, codec=BlockCodec(zstd_level=level), append=append, workers=workers, parity=parity,
                     pack_target=max(1 << 16, int(pack_mb * (1 << 20))), encrypt=encrypt,
-                    cloud_files=cloud_files)
+                    cloud_files=cloud_files, precheck=precheck)
+    if w.stats.precheck:
+        print(f"{'warning: ' if w.stats.precheck_fixed else ''}checked before writing "
+              f"({time.time() - t0:.1f}s): {w.stats.precheck}", file=sys.stderr if w.stats.precheck_fixed else sys.stdout)
+    elif append and not w.created and not precheck:
+        print("warning: --no-precheck: the existing store was not checked before writing", file=sys.stderr)
     if w.recovered_bytes:
         print(f"note: discarded {w.recovered_bytes:,} bytes left by an interrupted earlier run",
               file=sys.stderr)
@@ -2853,6 +2987,7 @@ def _write(store: str, src: str, append: bool, level: int = 19, workers: int | N
     print(_fmt(st))
     read = st.input_bytes - st.reused_bytes
     print(f"time={dt:.1f}s (read {read / 1e6:.1f} MB at {read / 1e6 / dt if dt else 0:.1f} MB/s)")
+    print(f"read back and proved {st.readback} new block(s) before publishing the snapshot")
     if st.changed:
         print(f"warning: {len(st.changed)} file(s) kept changing while they were read (read twice); they "
               f"are stored, but each copy may mix old and new content. The next backup reads them again:",
@@ -2865,7 +3000,7 @@ def _write(store: str, src: str, append: bool, level: int = 19, workers: int | N
         print(f"parity {st.parity}: {store}.hcp")
     if st.skipped:
         _print_skipped(st.skipped)
-    return 3 if st.skipped or st.changed or st.parity.startswith("warning") else 0
+    return 3 if st.skipped or st.changed or st.parity.startswith("warning") or st.precheck_fixed else 0
 
 
 def _prune_cli(a) -> int:
@@ -2966,6 +3101,9 @@ def main(argv) -> int:
         if name == "backup":
             p.add_argument("--rehash", action="store_true",
                            help="read every file, even ones whose size and mtime are unchanged")
+            p.add_argument("--no-precheck", action="store_true",
+                           help="skip proving the existing store intact before writing (on by default: it "
+                                "reads the whole store once: about 7 s per GB from a USB hard disk)")
         else:
             p.add_argument("--force", action="store_true",
                            help="replace an existing store (all its snapshots are lost)")
@@ -3155,7 +3293,7 @@ def _main(a) -> int:
         if a.cmd == "backup":
             return _write(a.store, a.input_dir, append=True, level=a.level, workers=a.workers,
                           rehash=a.rehash, pack_mb=a.pack_mb, encrypt=a.encrypt,
-                          cloud_files=a.cloud_files)
+                          cloud_files=a.cloud_files, precheck=not a.no_precheck)
         if a.cmd == "prune":
             return _prune_cli(a)
         if a.cmd == "parity":
