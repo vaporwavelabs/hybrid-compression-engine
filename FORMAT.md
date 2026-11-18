@@ -230,12 +230,24 @@ The new store must pass a full `verify` before it is renamed over the old one.
 ## 5. Restoring a snapshot
 
 1. **Paths:** split each path on `/` or `\`. Reject the path if any part is
-   empty, `.`, or `..`, or (on Windows) contains `:`. Each resolved
-   destination must stay inside the output directory.
+   empty, `.`, or `..`, or (on Windows) contains `:`. Reject the snapshot if a
+   path appears twice, or if any entry lies below a link entry of the same
+   snapshot (no backup produces either). Each resolved destination must stay
+   inside the output directory: resolve the parent folder again just before
+   writing each entry, links included. Names the restoring system cannot hold
+   (Windows device names such as `CON` or `aux.c`, a trailing dot or space,
+   names differing only in case on a case-insensitive disk) may be skipped
+   with a warning.
 2. **Files:**
-   * Concatenate the chunks.
-   * The result must match `size` and `sha256`; otherwise fail.
-   * Write to a temporary name, then rename over the destination.
+   * A file list entry may not have more pointers than `size` bytes (each
+     chunk holds at least one byte); otherwise the manifest is damaged.
+   * Concatenate the chunks. Stop with an error as soon as the total passes
+     `size`; at the end it must match `size` and `sha256`.
+   * Write to a new temporary file created exclusively (a random name, never
+     an existing file or link), then rename over the destination. The
+     reference reader proves every file of the snapshot this way before it
+     renames any of them, so a damaged store changes nothing in the folder.
+   * Do not restore setuid/setgid bits.
 3. **Metadata for each file:** set the mtime first, then the mode bits or
    Windows attributes. Read-only is applied last, so it can't block the mtime.
 4. **Symlinks** are created after all files, so no file is ever written

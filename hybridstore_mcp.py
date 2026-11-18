@@ -18,7 +18,7 @@ lines of JSON-RPC).
 """
 from __future__ import annotations
 
-import codecs, difflib, fnmatch, json, os, re, sys, time
+import codecs, difflib, fnmatch, json, os, re, subprocess, sys, time
 from collections import deque
 
 import hybridstore as hs
@@ -29,6 +29,8 @@ MAX_OUT = 100_000            # characters returned by one tool call
 MAX_LINE = 400               # characters of one line shown by search
 DIFF_MAX = 4 << 20           # largest file that file-level diff will load
 SNIFF = 8192
+LINE_CAP = 1 << 20           # characters of one line held in memory; longer lines come in pieces
+REGEX_GRACE = 5              # seconds a regex search may run past its budget before it is killed
 
 
 class ToolError(Exception):
@@ -68,26 +70,58 @@ def _encoding(head: bytes) -> str | None:
     return "utf-8"
 
 
-def _lines(chunks, enc: str):
-    """Decode a chunk stream incrementally and yield lines without their newline."""
+def _pieces(chunks, enc: str, cap: int | None = None):
+    """Decode a chunk stream incrementally and yield (line number, offset in
+    the line, text, more) without newlines. A line longer than cap characters
+    comes as several pieces (more=True on all but its last), so memory stays
+    bounded however long a line is (one-line JSON, minified code)."""
+    cap = cap or LINE_CAP
     dec = codecs.getincrementaldecoder(enc)(errors="replace")
-    pend: list[str] = []         # pieces of the unfinished line; joined once (a 10 MB line was quadratic)
+    no, off, pend, plen = 1, 0, [], 0    # pend: parts of the current piece (joined once; joining per chunk was quadratic)
+
+    def feed(seg):
+        nonlocal off, pend, plen
+        while seg:
+            if plen == cap:                     # full, and the line goes on: emit a piece
+                yield no, off, "".join(pend), True
+                off, pend, plen = off + plen, [], 0
+            take = seg[:cap - plen]
+            pend.append(take)
+            plen += len(take)
+            seg = seg[len(take):]
+
+    def end_line():
+        nonlocal no, off, pend, plen
+        item = (no, off, "".join(pend).rstrip("\r"), False)
+        no, off, pend, plen = no + 1, 0, [], 0
+        return item
+
     for c in chunks:
         s = dec.decode(c)
-        if "\n" not in s:
-            if s:
-                pend.append(s)
+        if not s:
             continue
         parts = s.split("\n")
-        if pend:
-            parts[0] = "".join(pend) + parts[0]
-        pend = [parts.pop()]
+        last = parts.pop()
         for p in parts:
-            yield p.rstrip("\r")
-    pend.append(dec.decode(b"", final=True))
-    tail = "".join(pend)
-    if tail:
-        yield tail.rstrip("\r")
+            if not plen and not off and len(p) <= cap:
+                yield no, 0, p.rstrip("\r"), False     # the usual case: a whole short line
+                no += 1
+            else:
+                yield from feed(p)
+                yield end_line()
+        yield from feed(last)
+    yield from feed(dec.decode(b"", final=True))
+    if plen or off:
+        yield end_line()
+
+
+def _lines(chunks, enc: str):
+    """Decode a chunk stream incrementally and yield lines without their
+    newline; a line longer than LINE_CAP characters is cut to its first
+    LINE_CAP (line numbers stay right)."""
+    for _, off, text, _ in _pieces(chunks, enc):
+        if not off:
+            yield text
 
 
 def _clip(line: str, start: int = 0) -> str:
@@ -122,8 +156,9 @@ class _Out:
 # ---------------------------------------------------------------- tools
 
 class StoreTools:
-    def __init__(self, stores: dict[str, str]):
+    def __init__(self, stores: dict[str, str], in_worker: bool = False):
         self.stores = stores
+        self.in_worker = in_worker      # True in the child process that runs a regex search
 
     # ---- shared ----
     def _path(self, a: dict) -> str:
@@ -284,24 +319,32 @@ class StoreTools:
 
             out, shown, last, more = _Out(), 0, start - 1, False
             out.add(head)
-            for no, line in enumerate(_lines(chunks(), enc), 1):
+            for no, off, line, cont in _pieces(chunks(), enc):
                 if no < start:
                     continue
                 sc = start_char if no == start else 0
-                if sc:
-                    line = line[sc:]
+                if cont and off + len(line) <= sc:
+                    continue                    # a piece of a long line before start_char
+                if sc > off:
+                    line = line[sc - off:]
+                pos = max(sc, off)              # where `line` starts within the whole line
                 if shown >= max_lines:
                     more = True
                     break
-                if not out.add(f"{no:>6}\t{line}"):
-                    if shown == 0:
-                        # One line longer than the whole budget (minified code, one-line JSON):
-                        # show a piece and page inside the line, so every character stays
-                        # reachable and the hint always moves forward.
-                        room = max(1000, MAX_OUT - out.n - 200)
-                        out.parts.append(f"{no:>6}\t{line[:room]}")
-                        out.parts.append(f"... line {no} continues ({len(line) - room:,} more characters): "
-                                         f"call again with start_line={no}, start_char={sc + room}")
+                if cont or not out.add(f"{no:>6}\t{line}"):
+                    if shown == 0 or cont:
+                        # A line longer than the whole budget (minified code, one-line JSON),
+                        # or one held in pieces: show a part and page inside the line, so every
+                        # character stays reachable and the hint always moves forward.
+                        room = min(len(line), max(1000, MAX_OUT - out.n - 200))
+                        if shown and not out.add(f"{no:>6}\t{line[:room]}"):
+                            more = True
+                            break
+                        if not shown:
+                            out.parts.append(f"{no:>6}\t{line[:room]}")
+                        left = "" if cont else f" ({len(line) - room:,} more characters)"
+                        out.parts.append(f"... line {no} continues{left}: "
+                                         f"call again with start_line={no}, start_char={pos + room}")
                         return out.text()
                     more = True
                     break
@@ -326,6 +369,8 @@ class StoreTools:
         ctx = self._int(a, "context", 0, 0, 5)
         max_file = self._int(a, "max_file_mb", 32, 1, 4096) << 20
         budget = self._int(a, "seconds", 20, 1, 120)
+        if a.get("regex") and not self.in_worker:
+            return self._search_isolated(a, pattern, budget)
         t0, out, hits, nfiles, nskip, stop = time.monotonic(), _Out(), 0, 0, 0, ""
         with self._open(a) as r:
             n, snap = self._snap(r, a.get("snapshot"))
@@ -367,7 +412,7 @@ class StoreTools:
                         yield from it
 
                     before, after = deque(maxlen=ctx), 0
-                    for no, line in enumerate(_lines(chunks(), enc), 1):
+                    for no, _, line, _ in _pieces(chunks(), enc):
                         m = rx.search(line)
                         if m:
                             for bno, bline in before:
@@ -393,6 +438,30 @@ class StoreTools:
         if cand is not None:
             note = f"catalog: {nread} file(s) read; the rest cannot contain the pattern"
         return "\n".join([head] + out.parts + ([f"... {stop}"] if stop else []) + ([f"({note})"] if note else []))
+
+    def _search_isolated(self, a: dict, pattern: str, budget: int) -> str:
+        """Run a regular-expression search in a child process and kill it at
+        the deadline. Python's re cannot be interrupted, and a pattern such as
+        (a+)+$ takes exponential time on some lines, which would otherwise
+        block this single-threaded server far past `seconds`."""
+        req = json.dumps({"stores": self.stores, "password": hs._password, "args": a})
+        deadline = budget + REGEX_GRACE
+        try:
+            p = subprocess.run([sys.executable, os.path.abspath(__file__), "--search-worker"],
+                               input=req.encode("utf-8"), capture_output=True, timeout=deadline,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except subprocess.TimeoutExpired:
+            return (f"search stopped: the regular expression {pattern!r} was still running after {deadline} s "
+                    f"and was cancelled, with no results. Nested repetition such as (a+)+ or (.*)* can take "
+                    f"exponential time on some lines: simplify the pattern, search for plain text, or narrow "
+                    f"dir/glob.")
+        try:
+            res = json.loads(p.stdout.decode("utf-8"))
+        except ValueError:
+            raise ToolError(f"the search process failed: {p.stderr.decode('utf-8', 'replace')[-500:].strip()}")
+        if res["error"]:
+            raise ToolError(res["text"].removeprefix("error: "))
+        return res["text"]
 
     def find_files(self, a: dict) -> str:
         import sqlite3
@@ -569,7 +638,8 @@ TOOLS = [
      "inputSchema": {"type": "object", "required": ["pattern"], "properties": {
          **_STORE, **_SNAP,
          "pattern": {"type": "string", "description": "Text to find (a regular expression if regex is true)."},
-         "regex": {"type": "boolean", "description": "Treat pattern as a Python regular expression."},
+         "regex": {"type": "boolean", "description": "Treat pattern as a Python regular expression. It runs "
+                   "in a separate process that is cancelled when `seconds` (plus a few) run out."},
          "case_sensitive": {"type": "boolean", "description": "Default false."},
          "dir": {"type": "string", "description": "Only search under this directory."},
          "glob": {"type": "string", "description": "Only search files matching, e.g. *.py."},
@@ -673,7 +743,19 @@ def serve(tools: StoreTools, rin=None, wout=None):
         send({"jsonrpc": "2.0", "id": mid, "result": result})
 
 
+def _search_worker() -> int:
+    """Child process of _search_isolated: one search, request and answer as JSON."""
+    req = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+    if req.get("password") is not None:
+        hs.set_password(req["password"])
+    text, bad = call_tool(StoreTools(req["stores"], in_worker=True), "search", req["args"])
+    sys.stdout.buffer.write(json.dumps({"text": text, "error": bad}).encode("utf-8"))
+    return 0
+
+
 def main(argv) -> int:
+    if argv[:1] == ["--search-worker"]:
+        return _search_worker()
     stores, rest = {}, []
     it = iter(argv)
     for arg in it:

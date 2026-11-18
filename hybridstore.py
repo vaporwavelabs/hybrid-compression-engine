@@ -53,6 +53,8 @@ import io
 import json
 import os
 import re
+import secrets
+import shutil
 import socket
 import stat
 import struct
@@ -253,6 +255,10 @@ class RestoreConflictError(Exception):
         super().__init__(f"{len(conflicts)} item(s) already exist in the output folder and would be "
                          f"overwritten: {', '.join(conflicts[:5])}{more}. Nothing was written. Restore into "
                          f"an empty folder, or pass overwrite=True / --force to replace them")
+
+
+class RestoreSpaceError(ValueError):
+    """The snapshot's files do not fit in the free space of the output disk."""
 
 
 class _StoreLock:
@@ -926,7 +932,10 @@ def _apply_meta(path: str, e: "FileEntry"):
         elif e.mode and not e.mode & stat.S_IWUSR and e.kind == KIND_FILE:
             _set_win_attrs(path, 0x1)
     elif e.mode:
-        os.chmod(path, stat.S_IMODE(e.mode))
+        mode = stat.S_IMODE(e.mode)
+        if e.kind == KIND_FILE:
+            mode &= ~(stat.S_ISUID | stat.S_ISGID)    # never hand out setuid/setgid from a store
+        os.chmod(path, mode)
 
 
 def _safe_parts(path: str) -> list[str]:
@@ -938,6 +947,42 @@ def _safe_parts(path: str) -> list[str]:
     if bad:
         raise IntegrityError(f"unsafe path in manifest: {path!r}")
     return parts
+
+
+CASE_INSENSITIVE_FS = os.name == "nt" or sys.platform == "darwin"
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} | \
+    {f"{d}{i}" for d in ("COM", "LPT") for i in list("123456789") + ["\u00b9", "\u00b2", "\u00b3"]}
+_WIN_BAD_CHARS = re.compile(r'[<>"|?*\x00-\x1f]')
+LINK_TARGET_MAX = 64 * 1024          # longer than any path a system accepts
+
+
+def _unportable(parts: list[str]) -> str:
+    """Why this path cannot be created on this system ('' when it can). Such
+    entries are legitimate on the system that made the store (aux.c on Linux),
+    so restore skips them with a warning instead of failing."""
+    for p in parts:
+        if "\x00" in p:
+            return "the name contains a NUL character"
+        if os.name != "nt":
+            continue
+        if any("\udc80" <= ch <= "\udcff" for ch in p):
+            return f"{p!r} is not valid Unicode, which Windows needs"
+        if _WIN_BAD_CHARS.search(p):
+            return f"{p!r} contains a character Windows does not allow in names"
+        if p[-1] in ". ":
+            return f"{p!r} ends with a dot or space, which Windows drops"
+        if p.split(".")[0].rstrip(" ").upper() in _WIN_RESERVED:
+            return f"{p!r} is a reserved device name on Windows"
+    return ""
+
+
+def _existing_ancestor(path: str) -> str:
+    while not os.path.isdir(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    return path
 
 
 class StoreWriter:
@@ -1245,7 +1290,18 @@ class StoreWriter:
         every directory (so empty ones and their metadata survive), symlinks /
         junctions as links (never followed), regular files. Uses scandir, so
         on Windows the stat comes from the directory listing for free.
-        Directories that cannot be listed are reported as skipped."""
+        Directories that cannot be listed are reported as skipped.
+
+        The store being written and its sidecars (<store>.hcs-new, .lock,
+        .hcp, .cat, .sem, ...) are left out when the store sits inside the
+        folder: otherwise every backup would copy the store into itself."""
+        own = os.path.normcase(os.path.basename(self.path))
+        own_dir = os.path.normcase(os.path.realpath(os.path.dirname(os.path.abspath(self.path))))
+
+        def is_own(path, name):
+            n = os.path.normcase(name)
+            return (n == own or n.startswith(own + ".")) and os.path.normcase(os.path.realpath(path)) == own_dir
+
         def visit(path):
             try:
                 with os.scandir(path) as it:
@@ -1255,6 +1311,8 @@ class StoreWriter:
                 return
             dirs, files = [], []
             for de in ents:
+                if is_own(path, de.name):
+                    continue
                 try:
                     if de.is_symlink() or (hasattr(de, "is_junction") and de.is_junction()):
                         isdir = de.is_dir()
@@ -1865,6 +1923,8 @@ class StoreReader:
                 else:
                     size, sha, cnt = struct.unpack_from("<Q32sI", m, o); o += 44
                     kind, mt, mode, attrs = KIND_FILE, -1, 0, 0
+                if cnt > max(size, 1):
+                    raise ValueError(f"entry {path!r} has more chunks ({cnt:,}) than bytes ({size:,})")
                 ptr_list = np.frombuffer(m, dtype="<u8", count=cnt, offset=o).tolist(); o += 8 * cnt
                 entries.append(FileEntry(path, size, sha, ptr_list, kind, mt, mode, attrs))
             skipped = []
@@ -1931,13 +1991,18 @@ class StoreReader:
         return s
 
     def iter_file(self, e: FileEntry):
-        """Yield the file's chunks; raises IntegrityError at the end if the
+        """Yield the file's chunks; raises IntegrityError as soon as the data
+        runs past the recorded size (a damaged or hostile file list could
+        otherwise repeat one chunk without end), and at the end if the
         reassembled file does not match its recorded size and SHA-256."""
         h, n = hashlib.sha256(), 0
         for p in e.pointers:
             c = self._chunk(p)
-            h.update(c)
             n += len(c)
+            if n > e.size:
+                raise IntegrityError(f"{e.path}: its data runs past its recorded size ({e.size:,} bytes); "
+                                     f"the file list is damaged")
+            h.update(c)
             yield c
         if n != e.size or h.digest() != e.sha256:
             raise IntegrityError(f"SHA-256 mismatch restoring {e.path}")
@@ -1945,28 +2010,87 @@ class StoreReader:
     def read_file(self, e: FileEntry) -> bytes:
         return b"".join(self.iter_file(e))
 
+    def _restore_plan(self, snap: Snapshot, warnings: list[str]) -> list[tuple[list[str], FileEntry]]:
+        """Check every path of a snapshot before anything is written. Paths no
+        backup can produce (escaping the folder, listed twice, or lying inside
+        a symlink of the same snapshot) raise IntegrityError. Paths this system
+        cannot hold (Windows device names, names differing only in case on a
+        case-insensitive disk) are skipped with a warning, with everything
+        below them."""
+        keyed, links, seen = [], set(), set()
+        for e in snap.entries:
+            parts = _safe_parts(e.path)
+            key = "/".join(parts)
+            if key in seen:
+                raise IntegrityError(f"unsafe file list: {e.path} appears twice in the snapshot")
+            seen.add(key)
+            if e.kind in (KIND_LINK, KIND_DIRLINK):
+                links.add(key)
+            keyed.append((parts, key, e))
+        plan, skipped, folded = [], set(), {}
+        for parts, key, e in keyed:
+            above = ["/".join(parts[:i]) for i in range(1, len(parts))]
+            inside_link = next((a for a in above if a in links), None)
+            if inside_link is not None:
+                raise IntegrityError(f"unsafe file list: {e.path} lies inside the symlink {inside_link}; "
+                                     f"no backup contains that")
+            if any(a in skipped for a in above):
+                skipped.add(key)
+                continue
+            why = _unportable(parts)
+            if not why and CASE_INSENSITIVE_FS:
+                other = folded.setdefault(key.casefold(), e.path)
+                if other != e.path:
+                    why = f"this system ignores case in names, and {other} has the same name"
+            if why:
+                warnings.append(f"{e.path}: not restored ({why})")
+                skipped.add(key)
+                continue
+            plan.append((parts, e))
+        return plan
+
     def unpack(self, out_dir: str, snapshot: int | None = None, overwrite: bool = False,
                fsync: bool = False) -> list[str]:
         """Restore a snapshot: files, directories (including empty ones),
-        modification times, read-only / permission bits, Windows hidden /
-        system attributes and symlinks. Symlinks are created last, so no
-        restored file is ever written through one. Returns warnings for
+        modification times, read-only / permission bits (not setuid/setgid),
+        Windows hidden / system attributes and symlinks. Returns warnings for
         things that could not be restored (e.g. symlinks on Windows without
-        the privilege to create them).
+        the privilege to create them, names Windows cannot hold).
+
+        The restore is safe with stores from anywhere:
+        - every path is checked first; nothing is written outside out_dir,
+          nothing is written through a symlink, and symlinks are created last,
+          after re-checking where each one goes;
+        - every file is first written to a new temporary file (created
+          exclusively, never through an existing link) and its size and
+          SHA-256 are proven; only when ALL files and link targets are proven
+          are they renamed into place, so a damaged store changes nothing in
+          out_dir (also with overwrite=True);
+        - the files must fit in the free space, checked before writing.
 
         Existing files, links or folders in the way are never replaced unless
         overwrite=True: the whole snapshot is checked first and
         RestoreConflictError lists them before anything is written.
 
+        snapshot=None means the newest. If the newest snapshot's footer is
+        damaged, IntegrityError says so instead of quietly restoring an older
+        one; pass that older snapshot's number explicitly, or run repair.
+
         fsync=True makes each restored file durable before it is renamed into
         place (and, on POSIX, each directory at the end): slower, but a power
         cut right after the restore cannot leave empty or partial files."""
+        if snapshot is None and self.tail_snapshot is not None:
+            raise IntegrityError(f"{self._tail_message()}. Nothing was restored; to restore the newest "
+                                 f"readable snapshot instead, ask for it by number "
+                                 f"(--snapshot {len(self.snapshots)})")
         root = os.path.realpath(out_dir)
         snap = self._snapshot(snapshot)
+        warnings: list[str] = []
+        plan = self._restore_plan(snap, warnings)
         if not overwrite and os.path.isdir(root):
             clash = []
-            for e in snap.entries:
-                dest = os.path.join(root, *_safe_parts(e.path))
+            for parts, e in plan:
+                dest = os.path.join(root, *parts)
                 if e.kind == KIND_DIR:
                     if os.path.lexists(dest) and not os.path.isdir(dest):
                         clash.append(e.path)
@@ -1974,51 +2098,84 @@ class StoreReader:
                     clash.append(e.path)
             if clash:
                 raise RestoreConflictError(clash)
-        os.makedirs(root, exist_ok=True)
-        warnings, dirs, links = [], [], []
+        need = sum(e.size for _, e in plan if e.kind == KIND_FILE)
+        free = shutil.disk_usage(_existing_ancestor(root)).free
+        if need > free:
+            raise RestoreSpaceError(f"the snapshot's files need {need:,} bytes but only {free:,} are free "
+                                    f"at {root}; nothing was restored")
 
         def inside(p):
             return p == root or p.startswith(root + os.sep)
 
-        for e in snap.entries:
-            dest = os.path.join(root, *_safe_parts(e.path))
-            if not inside(os.path.realpath(os.path.dirname(dest))):
-                raise IntegrityError(f"unsafe path in manifest: {e.path}")
-            if e.kind == KIND_DIR:
-                if not inside(os.path.realpath(dest)):
-                    raise IntegrityError(f"unsafe path in manifest: {e.path}")
-                os.makedirs(dest, exist_ok=True)
-                dirs.append((dest, e))
-                continue
-            if e.kind in (KIND_LINK, KIND_DIRLINK):
-                links.append((dest, e))
-                continue
-            dest = os.path.realpath(dest)
-            if not dest.startswith(root + os.sep):
-                raise IntegrityError(f"unsafe path in manifest: {e.path}")
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            tmp = dest + ".hcs-partial"
-            try:
-                with open(tmp, "wb") as fh:
-                    for c in self.iter_file(e):
-                        fh.write(c)
-                    if fsync:
-                        fh.flush()
-                        os.fsync(fh.fileno())
-                if os.path.exists(dest):
+        def parent_of(parts, e):
+            # Resolved now, so a link already in the folder that leads outside is caught.
+            parent = os.path.realpath(os.path.join(root, *parts[:-1]))
+            if not inside(parent):
+                raise IntegrityError(f"unsafe path: {e.path} would be written outside {root} "
+                                     f"(a link in the way leads elsewhere)")
+            return parent
+
+        created: list[str] = []         # folders this restore made; removed again if it fails
+
+        def mkdirs(d):
+            missing, p = [], d
+            while not os.path.lexists(p):
+                missing.append(p)
+                p = os.path.dirname(p)
+            os.makedirs(d, exist_ok=True)
+            created.extend(reversed(missing))
+
+        staged, dirs, links, moved = [], [], [], 0    # staged: (temp file, destination, entry)
+        try:
+            # 1. write and prove everything, changing nothing that exists
+            mkdirs(root)
+            for parts, e in plan:
+                if e.kind == KIND_DIR:
+                    dest = os.path.join(parent_of(parts, e), parts[-1])
+                    if os.path.lexists(dest) and not inside(os.path.realpath(dest)):
+                        raise IntegrityError(f"unsafe path: {e.path} is a link in the output folder "
+                                             f"that leads outside {root}")
+                    mkdirs(dest)
+                    dirs.append((dest, e))
+                elif e.kind in (KIND_LINK, KIND_DIRLINK):
+                    if e.size > LINK_TARGET_MAX:
+                        raise IntegrityError(f"{e.path}: symlink target of {e.size:,} bytes; the file list "
+                                             f"is damaged")
+                    links.append((parts, e, self.read_file(e).decode("utf-8", "surrogateescape")))
+                else:
+                    parent = parent_of(parts, e)
+                    dest = os.path.join(parent, parts[-1])
+                    if os.path.isdir(dest) and not _is_link(dest):
+                        raise RestoreConflictError([e.path])      # a folder is where the file goes
+                    mkdirs(parent)
+                    staged.append((self._write_temp(parent, e, fsync), dest, e))
+            # 2. everything is proven: move the files into place
+            for tmp, dest, e in staged:
+                if _is_link(dest):
+                    os.unlink(dest)                 # replace the link itself, never its target
+                elif os.path.lexists(dest):
                     _make_writable(dest)
                 os.replace(tmp, dest)
-            except BaseException:
+                moved += 1
+                _apply_meta(dest, e)
+        except BaseException:
+            for tmp, _, _ in staged[moved:]:
                 try:
                     os.remove(tmp)
                 except OSError:
                     pass
-                raise
-            _apply_meta(dest, e)
-        for dest, e in links:
-            target = self.read_file(e).decode("utf-8", "surrogateescape")
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            for d in reversed(created):
+                try:
+                    os.rmdir(d)                     # only if still empty
+                except OSError:
+                    pass
+            raise
+        # 3. links last; where each goes is checked again now that the files exist
+        for parts, e, target in links:
             try:
+                parent = parent_of(parts, e)
+                dest = os.path.join(parent, parts[-1])
+                os.makedirs(parent, exist_ok=True)
                 if _is_link(dest):
                     os.unlink(dest)
                 elif os.path.isdir(dest):
@@ -2036,7 +2193,7 @@ class StoreReader:
             except OSError as ex:
                 warnings.append(f"{e.path}: metadata not restored ({ex.strerror or ex})")
         if fsync and os.name != "nt":       # Windows cannot open a directory to fsync it
-            for d in {root} | {os.path.dirname(os.path.join(root, *_safe_parts(e.path))) for e in snap.entries}:
+            for d in {root} | {os.path.dirname(os.path.join(root, *parts)) for parts, _ in plan}:
                 try:
                     fd = os.open(d, os.O_RDONLY)
                     try:
@@ -2046,6 +2203,36 @@ class StoreReader:
                 except OSError:
                     pass
         return warnings
+
+    def _write_temp(self, parent: str, e: FileEntry, fsync: bool) -> str:
+        """Write a file's data, proven by size and SHA-256, to a new temporary
+        file in parent. The name is random and the file is created exclusively,
+        so an existing file or link with that name is never written through."""
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+                 | getattr(os, "O_NOFOLLOW", 0))
+        for _ in range(100):
+            tmp = os.path.join(parent, f".hcs-{secrets.token_hex(6)}.partial")
+            try:
+                fd = os.open(tmp, flags, 0o666)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise OSError(f"could not create a temporary file in {parent}")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                for c in self.iter_file(e):
+                    fh.write(c)
+                if fsync:
+                    fh.flush()
+                    os.fsync(fh.fileno())
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+        return tmp
 
     def check_layout(self):
         """Every byte from the header to the newest footer must belong to a
@@ -2132,6 +2319,10 @@ class StoreReader:
         n = 0
         for num in nums:
             s = self.snapshots[num - 1]
+            try:
+                self._restore_plan(s, [])       # paths no backup produces: restore would refuse them
+            except IntegrityError as x:
+                problems.append(f"snapshot {num}: {x}")
             for e in s.entries:
                 n += e.kind == KIND_FILE
                 key = (e.sha256, e.size, tuple(e.pointers))
@@ -3390,10 +3581,13 @@ def _main(a) -> int:
                         for path, reason in s.skipped:
                             print(f"       skipped {path}: {reason}")
                 print(f"store size {r.end:,} bytes")
+                if r.tail_snapshot is not None:
+                    print(f"error: {r._tail_message()}", file=sys.stderr)
+                    return 3
             elif a.cmd == "unpack":
                 try:
                     warnings = r.unpack(a.output_dir, a.snapshot, overwrite=a.force, fsync=a.fsync)
-                except RestoreConflictError as e:
+                except (RestoreConflictError, RestoreSpaceError) as e:
                     print(f"error: {e}", file=sys.stderr)
                     return 2
                 for w in warnings:

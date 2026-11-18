@@ -17,20 +17,20 @@ It lists five Phase I bugs and Phase II fixes: a naive XOR boundary test (fix: a
 | `hybridstore.py` | The engine and CLI (commands below) |
 | `bench.py` | Builds the sample datasets, checks round trips, runs an incremental-backup run and the corruption test, compares against baselines |
 | `bench_large.py` | Packs, verifies and restores one large file (default 2 GiB) and reports peak memory |
-| `test_hybridstore.py` | 46 checks (`HS_TEST_ONLY=encrypt,parity` runs a subset): streaming, snapshots, v1 compatibility, crash recovery, path safety, large media, locking, skipped files, strict verify, decompression bombs, metadata, unchanged-file reuse, prune (copy/repack/dictionary, policies, dry run, refusals), and the safeguards (damaged footers and manifests, `pack`/`unpack` refusals, files changing while read, full damage reports), Reed-Solomon parity (incremental = full rebuild, bit-exact repair of packs/manifests/footers/header, refusal beyond capacity, stale or damaged sidecar), interleaved parity (2 MiB bursts, `--m 4`), encryption (no plaintext on disk, wrong password vs damage, padding, CLI, MCP), `repair --dry-run`, cloud placeholders, damaged block lengths, Windows junctions, `--pack-mb` / `--fsync` |
+| `test_hybridstore.py` | 52 checks (`HS_TEST_ONLY=encrypt,parity` runs a subset): streaming, snapshots, v1 compatibility, crash recovery, path safety, large media, locking, skipped files, strict verify, decompression bombs, metadata, unchanged-file reuse, prune (copy/repack/dictionary, policies, dry run, refusals), and the safeguards (damaged footers and manifests, `pack`/`unpack` refusals, files changing while read, full damage reports), Reed-Solomon parity (incremental = full rebuild, bit-exact repair of packs/manifests/footers/header, refusal beyond capacity, stale or damaged sidecar), interleaved parity (2 MiB bursts, `--m 4`), encryption (no plaintext on disk, wrong password vs damage, padding, CLI, MCP), `repair --dry-run`, cloud placeholders, damaged block lengths, Windows junctions, `--pack-mb` / `--fsync`, and restore safety (hostile file lists, links, all-or-nothing restore, full disks, names Windows cannot hold, a hidden newest snapshot, a store inside its own source) |
 | `FORMAT.md` | Byte-level specification of the store format |
 | `hybridstore.cmd` | Windows launcher that uses the local `.venv` |
 | `hybridstore_mcp.py` | Read-only MCP server: lets an LLM list, read, search and diff snapshots without unpacking (see below) |
-| `test_hybridstore_mcp.py` | 11 checks for the MCP server: each tool, paging (also inside very long lines), encodings, path safety, the stdio protocol, prune while the server runs |
+| `test_hybridstore_mcp.py` | 13 checks for the MCP server: each tool, paging (also inside very long lines), encodings, path safety, the stdio protocol, prune while the server runs, regex searches cancelled at their deadline, lines held in pieces |
 | `hybridstore-mcp.cmd` | Windows launcher for the MCP server |
 | `hybridstore_catalog.py` | Catalog `<store>.cat`: path versions across snapshots + exact substring index, so agents search without decoding the store (see below) |
 | `test_hybridstore_catalog.py` | 8 checks: case folding for every Unicode character, incremental updates, catalog search equal to a full scan on random patterns, behind / pruned / damaged catalogs, encrypted stores get none |
 | `hybridstore_semantic.py` | Semantic index: `index`, `search`, `status`, `gc` (see below) |
 | `test_hybridstore_semantic.py` | 7 checks for the semantic index, using a fake embedding server |
-| `llm_accuracy.py` | Scores what the LLM tools return from a store against the original files on disk |
+| `llm_accuracy.py` | Scores what the MCP tools return from a store against the original files on disk (no LLM is involved: it checks the tools' output) |
 | `semantic_eval.py` | Scores semantic search on questions a chat model writes in its own words |
-| `bench_results.txt` | Output of the original benchmark run (Linux container, v1 engine) |
-| `bench_results_3090.txt` | Output of the latest benchmark run on a Windows 11 / RTX 3090 PC |
+| `bench_results.txt` | Output of the original benchmark run (Linux container, v1 engine); kept for history |
+| `bench_results_3090.txt` | Output of an older benchmark run on a Windows 11 / RTX 3090 PC (commit b4c99d1, before parity and encryption). It measures store bytes only; current figures, parity included, are in the table under "Reed-Solomon parity" below |
 | `bench_integrity.py` | Ratio, parity overhead and 200-bit-flip repair on the RDC comparison corpora |
 | `monitor.py` | Runs any command and prints elapsed time, MB read, MB/s, ETA, CPU cores and RAM every 10 s (optional CSV) |
 | `real_run.py` | Full real-data run under the monitor: pack, unchanged backup, verify, restore + SHA-256 compare, encrypted pack, damage + repair, `zstd -19 --long` baseline |
@@ -61,9 +61,9 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | 0 | OK |
-| 1 | Integrity error, or `verify` found damage or a cut-short store, or `backup` refused because the existing store is damaged (nothing written) |
-| 2 | Refused because it would destroy data: `pack` onto an existing store, or `unpack` over existing files (use `--force`) |
-| 3 | Finished with warnings: `backup`/`pack` skipped unreadable items or stored files that kept changing while read, `backup` rebuilt damaged bytes from parity before writing, or `unpack` could not create some symlinks |
+| 1 | Integrity error, or `verify` found damage or a cut-short store, or `backup` refused because the existing store is damaged (nothing written), or `unpack` without `--snapshot` while the newest snapshot's footer is damaged (nothing written) |
+| 2 | Refused because it would destroy data: `pack` onto an existing store, or `unpack` over existing files (use `--force`), or `unpack` whose files would not fit in the free space |
+| 3 | Finished with warnings: `backup`/`pack` skipped unreadable items or stored files that kept changing while read, `backup` rebuilt damaged bytes from parity before writing, `unpack` could not create some symlinks or skipped names this system cannot hold; `list` when the newest snapshot's footer is damaged |
 | 4 | Another backup is writing to the store |
 | 5 | The store is encrypted and no password, or the wrong one, was given |
 
@@ -82,6 +82,25 @@ A review damaged a scratch store on purpose. Detection was already complete, but
 | A file written to while it is being backed up | a mixed old/new copy stored, exit 0 | size + mtime are checked after reading; the file is read once more; if it is still changing it is stored but listed, exit 3 (the next backup reads it again) |
 | Damage found by `verify` | stopped at the first error | lists every damaged pack and every affected file in every snapshot, and which snapshots are fully intact |
 | A damaged older footer | `verify` failed with no fix | `repair` rewrites it in place |
+
+### Safe restores from any store (2026-11-17 review)
+
+A second review opened stores the engine did not write itself (a downloaded store, another machine's, one on a shared disk) and found restores that could be steered. All of these were reproduced, are fixed, and have a test:
+
+| Situation | Before | Now |
+|---|---|---|
+| A file list that repeats one chunk far past the file's recorded size | `unpack` wrote all of it before the SHA-256 check failed: a 746-byte store wrote 117 MB, with no upper limit | a file cannot list more chunks than bytes (refused when the list is read), and reading stops at the first chunk past the recorded size. `unpack` also checks the free space before writing |
+| A symlink named like the temporary file (`<file>.hcs-partial`) in the output folder | the restore wrote through it, outside the folder, even without `--force` | temporary files get random names and are created exclusively, so nothing is ever written through an existing name |
+| A crafted file list with a link inside a link (`a` → outside, then `a/b`) | the second link was created outside the folder, and `verify` called the store clean | refused before writing; `verify` reports it. No backup produces such a list |
+| A link already in the output folder that leads outside | caught for files, not re-checked for links | every destination is resolved again just before it is written, links included |
+| The same path twice in a file list | the later one silently won | refused before writing; `verify` reports it |
+| `unpack --force` meets a damaged file halfway | earlier files already replaced: the folder was half new, half old | every file is first written and proven in a temporary file; only when all of them are proven are they moved into place. Damage changes nothing in the folder, and folders the restore made are removed again |
+| The newest snapshot's footer damaged (one flipped bit) | `unpack` quietly restored the snapshot before it, printed `ok`, exit 0 | `unpack` refuses (exit 1) and says which snapshot number to ask for; `list` exits 3; `repair` brings the newest snapshot back |
+| A store kept inside the folder it backs up | it copied itself, its parity, catalog and lock into every snapshot, growing each night | the store and its sidecars (`<store>.*` next to it) are left out |
+| setuid / setgid bits in a store (Linux, restoring as root) | restored | never restored |
+| A Linux store with `aux.c`, `CON`, a trailing dot, or `A.txt` and `a.txt` restored on Windows | failed midway or overwrote one with the other | skipped with a warning naming each, exit 3; everything else is restored |
+| An agent sends a catastrophic regex to the MCP `search` (e.g. `(a+)+$`) | the server hung far past `seconds`: about a minute on a 30-character line | regex searches run in their own process, cancelled at `seconds` + 5 |
+| The MCP tools read a huge file with no line breaks | the whole line was held in memory: 871 MB to show 100 KB of a 256 MB file | lines over 1 M characters are read in pieces; the same call peaks at 38 MB |
 
 Deduplication keeps one copy of each chunk, so without parity one bad byte loses every file with data in that 1 MiB pack, in every snapshot that uses it. That is what the parity sidecar below is for.
 
@@ -243,7 +262,7 @@ These fixes address the problems found in the 2026-11-14 probes and fuzzing:
   * Windows read-only, hidden, system and archive attributes;
   * symlinks and junctions, stored as links and never followed.
 
-  Symlinks are restored last, so nothing is written through them. On Windows, creating them needs Developer Mode or admin; otherwise `unpack` warns (exit 3).
+  Symlinks are restored last, after every destination is checked again, so nothing is written through them. setuid/setgid bits are never restored. On Windows, creating symlinks needs Developer Mode or admin; otherwise `unpack` warns (exit 3).
 * **Safe `pack`.** A new store is written to `<store>.hcs-new` and only replaces the old one once it is complete, so a failed `pack` no longer destroys the previous store.
 
 ### Incremental backups, streaming and portability (v2 store format)
@@ -284,7 +303,7 @@ With many small files, the remaining limit is the single writer thread (per-chun
 * **Media before chunking:** magic-byte detection for PNG, JPEG, GIF, WebP, MP4, AVI, PDF, ZIP, gzip, bzip2, xz, 7z and zstd, run on the file's first bytes before chunking (WAV, BMP and TIFF are detected but routed as ordinary data). Files up to 64 MiB are stored as one object in their own block and are never sliced (see v2 notes for larger ones).
 * **Expansion guard:** each block is compressed with zstd-19 (plus zlib-9 if enabled) and the smallest result is kept. If no candidate is strictly smaller than the input, the block is written raw (codec bits = 0).
 * **16-byte header:** `'HCB' | flags u8 | orig_len u32 | stored_len u32 | crc32(original) u32`. The CRC is computed on the decoded bytes, so it also catches codec bugs.
-* **Integrity:** every file also stores its SHA-256. `unpack` and `verify` recompute it and raise `IntegrityError` if it doesn't match, so a restore is bit-exact or it fails. Unpack also rejects path traversal in the manifest.
+* **Integrity:** every file also stores its SHA-256. `unpack` and `verify` recompute it and raise `IntegrityError` if it doesn't match, so a restore is bit-exact or it fails, and it fails before changing anything in the output folder (see "Safe restores from any store"). Unpack also rejects path traversal, duplicate paths and paths inside links in the manifest.
 * **Neural codec:** `NeuralCodec` is a clearly marked stub and is disabled. Learned image codecs are lossy and need PyTorch plus model weights, which conflicts with this project's bit-exact goal.
 
 ### One addition beyond the paper: solid packs
@@ -360,7 +379,7 @@ python hybridstore_mcp.py --tools                                  # tool schema
 | `list_snapshots` | Snapshot numbers, times, file counts, sizes and source folders |
 | `list_files` | One directory (sub-directories with file counts, then files), or a flat list with `recursive` / `glob`; paged |
 | `read_file` | A text file with line numbers, paged by `start_line` / `max_lines`; UTF-8 and UTF-16; binary files get a one-line description |
-| `search` | grep over a snapshot's text files: literal or regex, `dir` / `glob` filters, context lines; identical files are searched once. With a current catalog, only files that can contain a literal pattern are read |
+| `search` | grep over a snapshot's text files: literal or regex, `dir` / `glob` filters, context lines; identical files are searched once. With a current catalog, only files that can contain a literal pattern are read. A regex search runs in its own process and is cancelled when `seconds` (+5) run out, so a pathological pattern cannot hang the server |
 | `diff_snapshots` | Files added, deleted and modified between two snapshots, or a unified diff of one file |
 | `find_files` | Paths matching a name part and/or glob across ALL snapshots at once, each version with the snapshot numbers holding it (from the catalog when current, else the manifests) |
 | `file_history` | In which snapshots a file was added, changed or deleted |

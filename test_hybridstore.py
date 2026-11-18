@@ -1267,6 +1267,263 @@ def _():
         assert len(r.snapshots) == 1 and r.verify() == 5
 
 
+def _can_link():
+    probe = os.path.join(TMP, "linkprobe")
+    try:
+        os.symlink(TMP, probe, target_is_directory=True)
+        os.unlink(probe)
+        return True
+    except (OSError, NotImplementedError):
+        return False
+
+
+def _dir_link(target, path):
+    """A directory link without privilege: a junction on Windows, a symlink elsewhere."""
+    if os.name == "nt":
+        import _winapi
+        _winapi.CreateJunction(target, path)
+    else:
+        os.symlink(target, path, target_is_directory=True)
+
+
+def _files_under(root):
+    return sorted(os.path.relpath(os.path.join(d, f), root) for d, _, fs in os.walk(root) for f in fs)
+
+
+@check("hostile file lists: data past the recorded size stops at once; impossible chunk counts are refused")
+def _():
+    base = os.path.join(TMP, "bomb"); os.makedirs(base)
+    seed_data = b"\xff\xd8\xff\xe0" + bytes((4 << 20) - 4)       # one whole-media object of zeros
+    # 1. more chunks than bytes: refused when the file list is read, nothing written
+    store = os.path.join(base, "count.hcs")
+    w = hs.StoreWriter(store, parity=False, workers=1)
+    w.add_file("seed.jpg", seed_data)
+    w.entries.append(hs.FileEntry("bomb.bin", 1, hashlib.sha256(b"x").digest(), [w.entries[-1].pointers[0]] * 8))
+    w.close()
+    out = os.path.join(base, "out1")
+    with hs.StoreReader(store) as r:
+        try:
+            r.unpack(out)
+            raise AssertionError("restored a file list with more chunks than bytes")
+        except hs.IntegrityError as e:
+            assert "more chunks" in str(e), e
+        assert any("more chunks" in p for p in r.scan()["problems"])
+    assert not os.path.exists(out) or not _files_under(out)
+    # 2. a plausible count whose data runs past the recorded size: iter_file stops at the first
+    #    chunk past it (bounded by size + one chunk), unpack writes nothing at all
+    store = os.path.join(base, "size.hcs")
+    w = hs.StoreWriter(store, parity=False, workers=1)
+    w.add_file("seed.jpg", seed_data)
+    w.add_file("ok.txt", b"fine\n")
+    w.entries.append(hs.FileEntry("bomb.bin", 1000, hashlib.sha256(b"x").digest(),
+                                  [w.entries[0].pointers[0]] * 1000))
+    w.close()
+    with hs.StoreReader(store) as r:
+        e = next(x for x in r.entries if x.path == "bomb.bin")
+        got = 0
+        try:
+            for c in r.iter_file(e):
+                got += len(c)
+            raise AssertionError("no error")
+        except hs.IntegrityError as err:
+            assert "runs past its recorded size" in str(err), err
+        assert got == 0, got
+        out = os.path.join(base, "out2")
+        try:
+            r.unpack(out)
+            raise AssertionError("no error")
+        except hs.IntegrityError:
+            pass
+        assert not os.path.exists(out), _files_under(out)     # not even ok.txt or the folder
+
+
+@check("restore never writes through a link and never outside the folder; verify flags such file lists")
+def _():
+    base = os.path.join(TMP, "escape"); os.makedirs(base)
+    outside = os.path.join(base, "outside"); os.makedirs(outside)
+    victim = os.path.join(outside, "victim.txt")
+    open(victim, "wb").write(b"ORIGINAL\n")
+    # 1. a link already in the output folder that leads outside: refused, also with --force
+    store = os.path.join(base, "plain.hcs")
+    src = os.path.join(base, "src"); tree(src, {"sub/victim.txt": b"ATTACKER\n", "top.txt": b"t\n"})
+    w = hs.StoreWriter(store, parity=False, workers=1); w.add_tree(src); w.close()
+    out = os.path.join(base, "out1"); os.makedirs(out)
+    _dir_link(outside, os.path.join(out, "sub"))
+    with hs.StoreReader(store) as r:
+        for force in (False, True):
+            try:
+                r.unpack(out, overwrite=force)
+                raise AssertionError("wrote through a link")
+            except (hs.IntegrityError, hs.RestoreConflictError):
+                pass
+    assert open(victim, "rb").read() == b"ORIGINAL\n"
+    assert not os.path.exists(os.path.join(out, "top.txt")), "a refused restore wrote files"
+    # 2. a crafted list with a link inside a link of the same snapshot (no backup produces it)
+    if _can_link():
+        lnk = os.path.join(base, "links"); os.makedirs(lnk)
+        os.symlink(outside, os.path.join(lnk, "dl"), target_is_directory=True)
+        os.symlink("victim.txt", os.path.join(lnk, "fl"))
+        store = os.path.join(base, "chain.hcs")
+        w = hs.StoreWriter(store, parity=False, workers=1)
+        w._add_special("a", os.path.join(lnk, "dl"), hs.KIND_DIRLINK)
+        w._add_special("a/b", os.path.join(lnk, "fl"), hs.KIND_LINK)
+        w.close()
+        with hs.StoreReader(store) as r:
+            assert any("inside the symlink" in p for p in r.scan()["problems"]), r.scan()["problems"]
+            try:
+                r.unpack(os.path.join(base, "out2"))
+                raise AssertionError("restored a link inside a link")
+            except hs.IntegrityError as e:
+                assert "inside the symlink" in str(e)
+        assert os.listdir(outside) == ["victim.txt"]
+        # 3. snapshot 1 plants '<file>.hcs-partial' (the old temp name) as a link to the victim;
+        #    restoring snapshot 2 into the same folder must not write through it
+        store = os.path.join(base, "partial.hcs")
+        s1 = os.path.join(base, "s1"); os.makedirs(s1)
+        os.symlink(victim, os.path.join(s1, "notes.txt.hcs-partial"))
+        s2 = os.path.join(base, "s2"); tree(s2, {"notes.txt": b"ATTACKER\n"})
+        for i, s in enumerate((s1, s2)):
+            w = hs.StoreWriter(store, append=i > 0, parity=False, workers=1); w.add_tree(s); w.close()
+        out = os.path.join(base, "out3")
+        with hs.StoreReader(store) as r:
+            r.unpack(out, snapshot=1)
+            r.unpack(out, snapshot=2)
+        assert open(victim, "rb").read() == b"ORIGINAL\n"
+        assert open(os.path.join(out, "notes.txt"), "rb").read() == b"ATTACKER\n"
+    # 4. the same path twice: refused before writing
+    store = os.path.join(base, "dup.hcs")
+    w = hs.StoreWriter(store, parity=False, workers=1)
+    w.add_file("a.txt", b"one\n"); w.add_file("a.txt", b"two\n")
+    w.close()
+    with hs.StoreReader(store) as r:
+        try:
+            r.unpack(os.path.join(base, "out4"))
+            raise AssertionError("restored a duplicate path")
+        except hs.IntegrityError as e:
+            assert "appears twice" in str(e)
+        assert any("appears twice" in p for p in r.scan()["problems"])
+    # 5. setuid / setgid are never restored (POSIX)
+    if os.name != "nt":
+        src = os.path.join(base, "suid"); tree(src, {"tool": b"#!/bin/sh\n"})
+        os.chmod(os.path.join(src, "tool"), 0o6755)
+        store = os.path.join(base, "suid.hcs")
+        w = hs.StoreWriter(store, parity=False, workers=1); w.add_tree(src); w.close()
+        out = os.path.join(base, "out5")
+        with hs.StoreReader(store) as r:
+            r.unpack(out)
+        mode = os.stat(os.path.join(out, "tool")).st_mode
+        assert not mode & 0o6000 and mode & 0o777 == 0o755, oct(mode)
+
+
+@check("restore is all or nothing: damage or a full disk changes nothing in the folder, also with --force")
+def _():
+    base = os.path.join(TMP, "atomic"); os.makedirs(base)
+    src = os.path.join(base, "src")
+    tree(src, {"a.bin": os.urandom(1_500_000), "new/dir/b.bin": os.urandom(1_500_000)})
+    store = os.path.join(base, "s.hcs")
+    w = hs.StoreWriter(store, parity=False, workers=1); w.add_tree(src); w.close()
+    out = os.path.join(base, "out"); tree(out, {"a.bin": b"OLD A\n"})
+    # a full disk: refused before anything is written
+    real = shutil.disk_usage
+    hs.shutil.disk_usage = lambda p: real(p)._replace(free=1000)
+    try:
+        with hs.StoreReader(store) as r:
+            r.unpack(out, overwrite=True)
+        raise AssertionError("no error")
+    except hs.RestoreSpaceError as e:
+        assert "nothing was restored" in str(e)
+    finally:
+        hs.shutil.disk_usage = real
+    assert _files_under(out) == ["a.bin"]
+    # damage in the last pack: a.bin is proven first, but nothing replaces the old file
+    with hs.StoreReader(store) as r:
+        last_pack = r.pack_offsets[-1]
+    b = bytearray(open(store, "rb").read()); b[last_pack + 5000] ^= 0x40; open(store, "wb").write(b)
+    try:
+        with hs.StoreReader(store) as r:
+            r.unpack(out, overwrite=True)
+        raise AssertionError("no error")
+    except hs.IntegrityError:
+        pass
+    assert open(os.path.join(out, "a.bin"), "rb").read() == b"OLD A\n"
+    assert _files_under(out) == ["a.bin"], _files_under(out)          # no temp files left
+    assert not os.path.exists(os.path.join(out, "new")), "the folders it made were left behind"
+
+
+@check("names this system cannot hold are skipped with a warning; the CLI exits 3")
+def _():
+    base = os.path.join(TMP, "names"); os.makedirs(base)
+    store = os.path.join(base, "s.hcs")
+    w = hs.StoreWriter(store, parity=False, workers=1)
+    w.add_file("ok.txt", b"fine\n")
+    w.add_file("Case.txt", b"upper\n")
+    w.add_file("case.txt", b"lower\n")
+    w.add_file("drivers/aux.c", b"int aux;\n")
+    w.add_file("trailing./x.txt", b"x\n")
+    w.close()
+    expect_skip = set()
+    if hs.CASE_INSENSITIVE_FS:
+        expect_skip.add("case.txt")
+    if os.name == "nt":
+        expect_skip |= {"drivers/aux.c", "trailing./x.txt"}
+    out = os.path.join(base, "out")
+    with hs.StoreReader(store) as r:
+        warns = r.unpack(out)
+    skipped = {x.split(":")[0] for x in warns}
+    assert skipped == expect_skip, (warns, expect_skip)
+    restored = {p.replace(os.sep, "/") for p in _files_under(out)}
+    assert restored == {"ok.txt", "Case.txt", "case.txt", "drivers/aux.c", "trailing./x.txt"} - expect_skip
+    assert open(os.path.join(out, "Case.txt"), "rb").read() == b"upper\n"
+    assert ("reserved" in hs._unportable(["aux.c"])) == (os.name == "nt")
+    if expect_skip:
+        p = subprocess.run([sys.executable, os.path.join(HERE, "hybridstore.py"), "unpack", store,
+                            os.path.join(base, "out_cli")], capture_output=True, text=True)
+        assert p.returncode == 3 and "not restored" in p.stderr, (p.returncode, p.stderr)
+
+
+@check("a damaged newest footer: unpack and list fail loudly instead of quietly using an older snapshot")
+def _():
+    base = os.path.join(TMP, "tailfooter"); os.makedirs(base)
+    store = os.path.join(base, "s.hcs")
+    for i, content in enumerate((b"version ONE\n", b"version TWO\n")):
+        src = os.path.join(base, f"s{i}"); tree(src, {"doc.txt": content})
+        w = hs.StoreWriter(store, append=i > 0, parity=False, workers=1, label="L"); w.add_tree(src); w.close()
+    b = bytearray(open(store, "rb").read()); b[-1] ^= 0x01; open(store, "wb").write(b)
+    hsp = [sys.executable, os.path.join(HERE, "hybridstore.py")]
+    p = subprocess.run(hsp + ["list", store], capture_output=True, text=True)
+    assert p.returncode == 3 and "footer is damaged" in p.stderr, (p.returncode, p.stderr)
+    out = os.path.join(base, "out")
+    p = subprocess.run(hsp + ["unpack", store, out], capture_output=True, text=True)
+    assert p.returncode == 1 and "Nothing was restored" in p.stderr and not os.path.exists(out), p.stderr
+    p = subprocess.run(hsp + ["unpack", store, out, "--snapshot", "1"], capture_output=True, text=True)
+    assert p.returncode == 0 and open(os.path.join(out, "doc.txt"), "rb").read() == b"version ONE\n"
+    with hs.StoreReader(store) as r:
+        try:
+            r.unpack(os.path.join(base, "out2"))
+            raise AssertionError("no error")
+        except hs.IntegrityError as e:
+            assert "--snapshot 1" in str(e)
+
+
+@check("a store inside the folder it backs up leaves itself and its sidecars out")
+def _():
+    base = os.path.join(TMP, "selfstore"); os.makedirs(base)
+    src = os.path.join(base, "data")
+    tree(src, {"doc.bin": os.urandom(300_000), "backup.hcs-notes.txt": b"a user file\n"})
+    store = os.path.join(src, "backup.hcs")
+    sizes = []
+    for i in range(3):
+        w = hs.StoreWriter(store, append=i > 0, workers=1); w.add_tree(src); w.close()
+        hs_cat = os.path.join(HERE, "hybridstore.py")
+        subprocess.run([sys.executable, hs_cat, "catalog", store], capture_output=True)
+        sizes.append(os.path.getsize(store))
+    with hs.StoreReader(store) as r:
+        for s in r.snapshots:
+            names = {e.path for e in s.entries}
+            assert names == {"doc.bin", "backup.hcs-notes.txt"}, names
+    assert sizes[2] - sizes[0] < 20_000, sizes          # unchanged data: only two small manifests added
+
+
 if __name__ == "__main__":
     shutil.rmtree(TMP, ignore_errors=True)
     print(f"\nall {len(passed)} checks passed")

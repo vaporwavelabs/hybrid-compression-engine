@@ -120,6 +120,17 @@ The sidecar sits on the same disk as the store. It covers bit rot and bad sector
 3. The command that failed, its exit code, and the monitor CSV if it was slow.
 4. Python version, OS, and whether the disk is local, USB, network or cloud-synced.
 
+## 9. `unpack` refused or skipped something
+
+| Message | Cause | Fix |
+|---|---|---|
+| "the newest snapshot (#N) is complete but its footer is damaged … Nothing was restored", exit 1 | one damaged footer hides the newest snapshot; restoring "newest" would quietly give you the one before it | `python hybridstore.py repair <store>` brings it back. To restore the older one anyway: `unpack … --snapshot N-1` |
+| "… need N bytes but only M are free … nothing was restored", exit 2 | the snapshot's files do not fit on the output disk (a restore needs room for the new files before old ones are replaced) | free space, or restore to another disk |
+| "unsafe file list: … lies inside the symlink …" / "… appears twice …", exit 1 | the file list could not have come from a backup: a damaged or crafted store. `verify` reports the same | do not restore it. If it is your own store, `doctor.py fix <store>` and `verify`; restore another snapshot with `--snapshot` |
+| "unsafe path: … would be written outside …", exit 1 | the output folder already holds a link or junction (at that path) that leads elsewhere | restore into an empty folder, or remove that link first |
+| "… not restored (… reserved device name on Windows)", "(… ends with a dot or space …)", "(… ignores case in names …)", exit 3 | the store was made on Linux or macOS with names Windows cannot hold (`aux.c`, `CON`, `name.`, `A.txt` beside `a.txt`) | everything else was restored. Restore those files on a Linux machine, or rename them there and back up again |
+| "the data runs past its recorded size" / "more chunks … than bytes", exit 1 | the file list is damaged or crafted; reading stopped before writing anything | as for damage: `verify`, then `repair` if there is parity |
+
 ## Sources
 
 1. BorgBackup, `borg check --repair` warnings: https://borgbackup.readthedocs.io/en/stable/usage/check.html

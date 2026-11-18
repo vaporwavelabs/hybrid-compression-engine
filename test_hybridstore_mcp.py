@@ -272,6 +272,57 @@ def _():
     assert p.returncode == 2 and b"store not found" in p.stderr, p
 
 
+@check("regex search runs in its own process and is cancelled at the deadline; the server stays usable")
+def _():
+    import time
+    src, store = os.path.join(TMP, "redos"), os.path.join(TMP, "redos.hcs")
+    tree(src, {"bad.txt": b"a" * 40 + b"!\n", "good.txt": b"alpha beta\n"})
+    backup(src, store)
+    t2 = mcp.StoreTools({"r": store})
+    t0 = time.monotonic()
+    text, bad = mcp.call_tool(t2, "search", {"pattern": "(a+)+$", "regex": True, "seconds": 1})
+    took = time.monotonic() - t0
+    assert not bad and "was cancelled" in text and took < 1 + mcp.REGEX_GRACE + 10, (took, text)
+    text, bad = mcp.call_tool(t2, "search", {"pattern": r"al\w+ beta", "regex": True})
+    assert not bad and "good.txt:1:alpha beta" in text, text
+    assert "bad regular expression" in mcp.call_tool(t2, "search", {"pattern": "(", "regex": True})[0]
+
+
+@check("lines longer than LINE_CAP are held in pieces: read_file pages through them, search finds text past the cap")
+def _():
+    src, store = os.path.join(TMP, "pieces"), os.path.join(TMP, "pieces.hcs")
+    body = "".join(f"<{i}>" for i in range(40_000))                     # ~260k characters, no newline
+    tree(src, {"one.txt": (body + " FARNEEDLE\nnext line\n").encode()})
+    backup(src, store)
+    t2 = mcp.StoreTools({"p": store})
+    old = mcp.LINE_CAP
+    mcp.LINE_CAP = 50_000                                                # well below the output budget
+    try:
+        got, line, char, calls = "", 1, 0, 0
+        while True:
+            text, bad = mcp.call_tool(t2, "read_file", {"path": "one.txt", "start_line": line,
+                                                        "start_char": char, "max_lines": 1})
+            assert not bad, text
+            calls += 1
+            rows = text.split("\n")[1:]
+            got += rows[0].split("\t", 1)[1]
+            if "continues" not in rows[-1]:
+                break
+            nxt = rows[-1].split("start_line=")[1]
+            line, char = int(nxt.split(",")[0]), int(nxt.split("start_char=")[1])
+            assert line == 1 and calls < 100
+        assert got == body + " FARNEEDLE", (len(got), len(body))
+        text, _ = mcp.call_tool(t2, "read_file", {"path": "one.txt", "start_line": 2})
+        assert "next line" in text, text
+        for regex in (False, True):
+            text, bad = mcp.call_tool(t2, "search", {"pattern": "FARNEEDLE", "regex": regex})
+            assert not bad and "1 match(es)" in text and "one.txt:1:" in text, text
+        lines = list(mcp._lines(iter([(body + "\nb\n").encode()]), "utf-8"))
+        assert lines == [body[:50_000], "b"], [len(x) for x in lines]
+    finally:
+        mcp.LINE_CAP = old
+
+
 if __name__ == "__main__":
     shutil.rmtree(TMP, ignore_errors=True)
     print(f"\n{len(passed)} checks passed")

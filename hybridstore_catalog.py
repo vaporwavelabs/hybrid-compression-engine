@@ -108,7 +108,7 @@ def _grams(pattern: str) -> list[str] | None:
 def _text_passages(r: hs.StoreReader, e: hs.FileEntry):
     """(status, [(start_line, end_line, text)]) for one file, decoded exactly
     as the MCP search tool decodes it."""
-    from hybridstore_mcp import _encoding, _lines
+    from hybridstore_mcp import _encoding, _pieces
     if e.size == 0:
         return "empty", []
     if e.size > MAX_FILE:
@@ -125,7 +125,7 @@ def _text_passages(r: hs.StoreReader, e: hs.FileEntry):
             yield from it
 
         out, buf, n, start, no = [], [], 0, 1, 0
-        for no, line in enumerate(_lines(chunks(), enc), 1):
+        for no, _, line, _ in _pieces(chunks(), enc):     # pieces of very long lines, as search reads them
             buf.append(line)
             n += len(line) + 1
             if n >= PASSAGE_CHARS:
