@@ -9,6 +9,7 @@ import hybridstore_mcp as mcp
 
 os.makedirs(os.path.join(HERE, "bench_data"), exist_ok=True)
 TMP = tempfile.mkdtemp(prefix="hcs-mcp-", dir=os.path.join(HERE, "bench_data"))
+os.environ["HYBRIDSTORE_STATE"] = os.path.join(TMP, "state")   # encryption pins stay in the test folder
 passed = []
 
 

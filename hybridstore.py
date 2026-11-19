@@ -242,6 +242,52 @@ def open_key_block(payload: bytes, password: str | None = None) -> bytes:
     return key
 
 
+# --------------------------------------------------------------------------
+# Encryption pins. Nothing inside a store can prove it was not swapped for an
+# unencrypted one (a stripped key block, or a whole new file), so this computer
+# remembers each store it has opened or created encrypted, as an empty marker
+# file named after the store's path, and refuses to read it unencrypted later.
+# Creating an unencrypted store at that path (pack without --encrypt) is the
+# owner's choice and clears the pin. HYBRIDSTORE_STATE=<dir> moves the markers,
+# HYBRIDSTORE_STATE=off turns pins off. Markers hold no names or secrets.
+# --------------------------------------------------------------------------
+STATE_ENV = "HYBRIDSTORE_STATE"
+_password_named = False             # the CLI was given --password-file for this one store
+
+
+def _pin_path(store: str) -> str | None:
+    d = os.environ.get(STATE_ENV)
+    if d is not None and d.strip().lower() in ("", "off", "0", "none"):
+        return None
+    if d is None:
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".local", "state")
+        d = os.path.join(base, "hybridstore")
+    key = os.path.normcase(os.path.realpath(os.path.abspath(store)))
+    return os.path.join(d, "encrypted-stores", hashlib.sha256(key.encode("utf-8", "surrogatepass")).hexdigest())
+
+
+def _pinned(store: str) -> str | None:
+    """The marker's path when `store` was last seen encrypted on this computer."""
+    p = _pin_path(store)
+    return p if p and os.path.exists(p) else None
+
+
+def _set_pin(store: str, encrypted: bool) -> None:
+    """Record (or clear) that `store` is encrypted. Best effort: never raises."""
+    p = _pin_path(store)
+    if not p:
+        return
+    try:
+        if encrypted:
+            if not os.path.exists(p):
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                open(p, "ab").close()
+        elif os.path.exists(p):
+            os.remove(p)
+    except OSError:
+        pass
+
+
 class StoreLockedError(Exception):
     """Another process (or another writer in this process) is writing the store."""
 
@@ -655,6 +701,11 @@ class BlockCodec:
         if olen > max(BLOCK_FLOOR, BLOCK_RATIO * slen):
             raise IntegrityError(f"block at {off} claims an implausible size ({olen:,} bytes from {slen:,})")
         sealed = bool(flags & FLAG_ENCRYPTED)
+        if not sealed and self.cipher is not None:
+            # Every block of an encrypted store is sealed. An unsealed one was not written
+            # by someone holding the key: reading it would let anyone add snapshots.
+            raise IntegrityError(f"block at {off} is not encrypted, but this store is: it was not written "
+                                 f"with the store's key (added or altered by someone else)")
         if sealed:
             if zlib.crc32(payload) & 0xFFFFFFFF != crc:
                 raise IntegrityError(f"CRC mismatch in encrypted block at {off} (damaged on disk)")
@@ -1561,6 +1612,7 @@ class StoreWriter:
             except OSError as e:
                 raise OSError(e.errno, f"could not replace {self.path} ({e.strerror}); "
                                        f"the new store is complete at {self.path}.hcs-new") from e
+            _set_pin(self.path, self.codec.cipher is not None)    # the owner chose this store's encryption
         self.stats.parity = self._update_parity()
         self.lock.release()
         self.stats.manifest_bytes = len(block)
@@ -1655,6 +1707,7 @@ class StoreReader:
     def __init__(self, path: str, codec: BlockCodec | None = None, cache_bytes: int = 256 << 20,
                  load_index: bool = False, password: str | None = None):
         self.f = open(path, "rb")
+        self.path = path
         try:
             self._open(codec, cache_bytes, load_index, password)
         except Exception:
@@ -1684,8 +1737,18 @@ class StoreReader:
             self.key_block, self.encrypted = hdr + payload, True
             pos += HDR.size + slen
             hdr = self._read(pos, HDR.size)
+            _set_pin(self.path, True)
         else:
             self.codec.set_key(None)
+            pin = _pinned(self.path)
+            if pin:
+                raise PasswordError(f"{self.path} was encrypted when this computer last opened it, but now it is "
+                                    f"not: it may have been replaced. Nothing was read. If you replaced it with an "
+                                    f"unencrypted store yourself, delete the marker {pin} and run again")
+            if _password_named:
+                raise PasswordError(f"{self.path} is not encrypted, but a password file was given for it: it may "
+                                    f"have been replaced with an unencrypted copy. Nothing was read. For an "
+                                    f"unencrypted store, give no password")
         if size > pos + HDR.size and len(hdr) == HDR.size and hdr[:3] == BLOCK_MAGIC and hdr[3] & FLAG_DICT:
             d, _, end = self._block(pos)
             self.codec.set_dictionary(d)
@@ -3382,8 +3445,8 @@ def main(argv) -> int:
     p.add_argument("--allow-partial", action="store_true",
                    help="do not fail on bytes left by an interrupted write / a cut-short store")
     a = ap.parse_args(argv)
-    global _prompt_ok
-    saved = (_prompt_ok, _password, sys.stderr)
+    global _prompt_ok, _password_named
+    saved = (_prompt_ok, _password, sys.stderr, _password_named)
     _prompt_ok = True
     tail = sys.stderr = _StderrTail(sys.stderr)
     try:
@@ -3398,6 +3461,7 @@ def main(argv) -> int:
         raise
     finally:            # main() may be called in-process (tests, other tools): leave no state behind
         _prompt_ok = saved[0]
+        _password_named = saved[3]
         set_password(saved[1])
         sys.stderr = saved[2]
     if code:
@@ -3484,9 +3548,11 @@ class _StderrTail:
 
 
 def _main(a) -> int:
+    global _password_named
     if a.password_file:
         with open(a.password_file, encoding="utf-8") as fh:
             set_password(fh.readline().rstrip("\r\n"))
+        _password_named = True      # every command takes one store: it must be encrypted
 
     try:
         if a.cmd == "passwd":

@@ -7,6 +7,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 os.makedirs(os.path.join(HERE, "bench_data"), exist_ok=True)
 TMP = tempfile.mkdtemp(prefix="hcs-doctor-", dir=os.path.join(HERE, "bench_data"))
+os.environ["HYBRIDSTORE_STATE"] = os.path.join(TMP, "state")   # encryption pins stay in the test folder
 os.environ["HYBRIDSTORE_LOG"] = os.path.join(TMP, "events.jsonl")
 os.environ.pop("HYBRIDSTORE_PASSWORD", None)
 import hybridstore as hs

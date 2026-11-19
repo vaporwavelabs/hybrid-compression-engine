@@ -12,6 +12,7 @@ np = hs.np
 
 os.makedirs(os.path.join(HERE, "bench_data"), exist_ok=True)   # gitignored; keeps temp data off C:
 TMP = tempfile.mkdtemp(prefix="hcs-test-", dir=os.path.join(HERE, "bench_data"))
+os.environ["HYBRIDSTORE_STATE"] = os.path.join(TMP, "state")   # encryption pins stay in the test folder
 rng = random.Random(1)
 passed = []
 
@@ -1023,7 +1024,7 @@ def _():
     before = open(plain, "rb").read()
     # a store that replaced the encrypted one gets no plaintext: --password-file or the env variable
     code, out = _quiet("backup", src, plain, "--password-file", pw)
-    assert code == 1 and "not encrypted" in out, (code, out)
+    assert code == 5 and "not encrypted" in out, (code, out)        # refused when opened (F1)
     os.environ[hs.PASSWORD_ENV] = "job password"
     try:
         code, out = _quiet("backup", src, plain)
@@ -1045,6 +1046,64 @@ def _():
     with hs.StoreReader(missing, password="job password") as r:
         assert r.encrypted and len(r.snapshots) == 2
     hs._KEYS.clear()
+
+
+@check("encryption: unsealed blocks are refused; a store seen encrypted is never read unencrypted")
+def _():
+    # 1. a block without the seal inside an encrypted store (an appended forged snapshot) is refused
+    keyed, plain = hs.BlockCodec(), hs.BlockCodec()
+    keyed.set_key(os.urandom(32))
+    block, _ = plain.encode(b"forged manifest", hs.FLAG_MANIFEST)
+    try:
+        keyed.decode_block(block[:hs.HDR.size], block[hs.HDR.size:], 123)
+        raise AssertionError("an unsealed block was accepted by an encrypted store")
+    except hs.PasswordError:
+        raise AssertionError("wrong error type")
+    except hs.IntegrityError as e:
+        assert "not encrypted" in str(e), e
+    sealed, _ = keyed.encode(b"real data", 0)
+    assert keyed.decode_block(sealed[:hs.HDR.size], sealed[hs.HDR.size:], 0)[0] == b"real data"
+    # 2. the encrypted store is swapped for an unencrypted one (key block stripped, or a new file):
+    #    refused even with no password given up front, as when the owner types it at the prompt
+    src = _enc_tree("enc5")
+    store, decoy = os.path.join(TMP, "enc5.hcs"), os.path.join(TMP, "enc5_decoy.hcs")
+    pw = os.path.join(TMP, "pw5.txt")
+    open(pw, "w").write("pin password\n")
+    hs.set_password(None); hs._KEYS.clear()
+    assert _quiet("pack", src, store, "--encrypt", "--password-file", pw)[0] == 0
+    assert hs._pinned(store)
+    assert _quiet("pack", src, decoy)[0] == 0
+    shutil.copyfile(decoy, store)
+    hs.set_password(None); hs._KEYS.clear()
+    for args in (("list", store), ("unpack", store, os.path.join(TMP, "enc5_out"))):
+        code, out = _quiet(*args)
+        assert code == 5 and "may have been replaced" in out, (args, code, out)
+    assert not os.path.exists(os.path.join(TMP, "enc5_out")) or not os.listdir(os.path.join(TMP, "enc5_out"))
+    try:
+        hs.StoreReader(store)
+        raise AssertionError("a pinned store was read unencrypted")
+    except hs.PasswordError:
+        pass
+    # 3. the owner re-packs it unencrypted on purpose: the pin is cleared and it reads as before
+    assert _quiet("pack", src, store, "--force")[0] == 0
+    assert not hs._pinned(store)
+    assert _quiet("list", store)[0] == 0
+    # 4. a password file named for an unencrypted store this computer never saw encrypted
+    code, out = _quiet("list", decoy, "--password-file", pw)
+    assert code == 5 and "not encrypted" in out, (code, out)
+    assert _quiet("list", decoy)[0] == 0
+    # ... while the password variable and the library still open unencrypted stores (multi-store tools)
+    os.environ[hs.PASSWORD_ENV] = "pin password"
+    try:
+        assert _quiet("list", decoy)[0] == 0
+    finally:
+        del os.environ[hs.PASSWORD_ENV]
+    hs.set_password("pin password")
+    try:
+        with hs.StoreReader(decoy) as r:
+            assert not r.encrypted
+    finally:
+        hs.set_password(None); hs._KEYS.clear()
 
 
 # ---------------------------------------------------------------- interleaved parity
