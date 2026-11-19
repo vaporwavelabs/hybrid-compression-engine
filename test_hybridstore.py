@@ -1618,6 +1618,39 @@ def _():
     assert sizes[2] - sizes[0] < 20_000, sizes          # unchanged data: only two small manifests added
 
 
+@check("terminal safety: store text cannot drive a terminal; joiners, RTL marks and pipes are unchanged")
+def _():
+    hostile = "lab\x1b]0;pwned\x07el\x1b[2J\r\x9b31m\x7f‮evil⁦x⁩ \udc9b"
+    shown = hs.term_safe(hostile)
+    assert not hs._TERM_UNSAFE.search(shown), shown
+    for frag in ("\\x1b]0;pwned\\x07", "\\x1b[2J", "\\x0d", "\\x9b31m", "\\x7f", "\\u202e", "\\u2066",
+                 "\\u2069", "\\u2028", "\\x9b"):
+        assert frag in shown, (frag, shown)
+    # Persian with a ZWNJ, LRM / RLM, an emoji ZWJ sequence, a soft hyphen, tab and newline pass through
+    ordinary = "tab\tand line\nmi‌xed می‌روم ‎LRM‏ RLM \U0001f469‍\U0001f4bb café ­hy"
+    assert hs.term_safe(ordinary) == ordinary
+    src = os.path.join(TMP, "termsafe"); tree(src, {"a.txt": b"hello"})
+    store = os.path.join(TMP, "termsafe.hcs")
+    label = "x\x1b]52;c;cHduZWQ=\x07y می‌ر"       # OSC 52 writes the clipboard
+    w = hs.StoreWriter(store, label=label); w.add_tree(src); w.close()
+
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+    import contextlib
+    before = sys.stdout
+    for tty in (True, False):
+        out, err = (Tty(), Tty()) if tty else (io.StringIO(), io.StringIO())
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            assert hs.main(["list", store]) == 0
+        text = out.getvalue()
+        if tty:      # a terminal sees the sequence as text, and the Persian label intact
+            assert "\x1b" not in text and "x\\x1b]52;c;cHduZWQ=\\x07y می‌ر" in text, text
+        else:        # a pipe gets exactly what the store holds, as before
+            assert label in text, text
+    assert sys.stdout is before
+
+
 if __name__ == "__main__":
     shutil.rmtree(TMP, ignore_errors=True)
     print(f"\nall {len(passed)} checks passed")

@@ -464,8 +464,10 @@ def main(argv) -> int:
                 with Index(a.store) as ix:
                     hits, cover = ix.search(r, r.snapshots[n - 1], a.query, a.k, a.dir, a.glob,
                                             rerank=not a.no_rerank)
-                    sys.stdout.buffer.write(format_hits(r, n, r.snapshots[n - 1], a.query, hits, cover,
-                                                        ix.model).encode("utf-8", "replace") + b"\n")
+                    found = format_hits(r, n, r.snapshots[n - 1], a.query, hits, cover, ix.model)
+                    if hs._is_terminal(sys.stdout):     # file text must not drive the terminal
+                        found = hs.term_safe(found)
+                    sys.stdout.buffer.write(found.encode("utf-8", "replace") + b"\n")
             elif a.cmd == "status":
                 with Index(a.store) as ix:
                     s = ix.stats()
@@ -486,4 +488,6 @@ def main(argv) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    with hs.terminal_safe_output():      # store text must not drive the terminal
+        code = main(sys.argv[1:])
+    sys.exit(code)

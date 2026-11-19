@@ -48,6 +48,7 @@ restored), 4 store locked by another backup. Format: FORMAT.md.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import io
 import json
@@ -3446,9 +3447,10 @@ def main(argv) -> int:
                    help="do not fail on bytes left by an interrupted write / a cut-short store")
     a = ap.parse_args(argv)
     global _prompt_ok, _password_named
-    saved = (_prompt_ok, _password, sys.stderr, _password_named)
+    saved = (_prompt_ok, _password, sys.stderr, _password_named, sys.stdout)
     _prompt_ok = True
-    tail = sys.stderr = _StderrTail(sys.stderr)
+    tail = sys.stderr = _StderrTail(_TermSafe.wrap(sys.stderr))   # a store must not drive the terminal
+    sys.stdout = _TermSafe.wrap(sys.stdout)
     try:
         code = _main(a)
     except Exception as e:      # not a known error: a bug. Record it for `doctor.py bugs`, then fail as before
@@ -3463,7 +3465,7 @@ def main(argv) -> int:
         _prompt_ok = saved[0]
         _password_named = saved[3]
         set_password(saved[1])
-        sys.stderr = saved[2]
+        sys.stderr, sys.stdout = saved[2], saved[4]
     if code:
         log_event({"kind": "error", "cmd": a.cmd, "store": _abs(getattr(a, "store", None)), "exit": code,
                    "message": tail.text()})
@@ -3545,6 +3547,62 @@ class _StderrTail:
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
+
+
+# Characters a terminal acts on instead of showing: C0/C1 controls other than tab and
+# newline (ESC starts CSI/OSC sequences that move the cursor, retitle the window, write
+# the clipboard; 0x9b is a one-byte CSI), DEL, line/paragraph separators, the bidi
+# embeddings, overrides and isolates that reorder text on screen, and lone surrogates
+# (bytes of a name that were not UTF-8). Joiners, LRM/RLM and the other format
+# characters ordinary text needs are left alone.
+_TERM_UNSAFE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f  ‪-‮⁦-⁩\ud800-\udfff]")
+
+
+def term_safe(text: str) -> str:
+    """`text` with each terminal-unsafe character shown as a visible \\xNN / \\uNNNN escape."""
+    def esc(m):
+        o = ord(m.group())
+        if 0xDC80 <= o <= 0xDCFF:           # surrogateescape: the original byte
+            o -= 0xDC00
+        return f"\\x{o:02x}" if o < 0x100 else f"\\u{o:04x}"
+    return _TERM_UNSAFE.sub(esc, text)
+
+
+def _is_terminal(stream) -> bool:
+    try:
+        return bool(stream and stream.isatty())
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+class _TermSafe:
+    """Wraps a stream that is a terminal so nothing printed to it (store labels, paths,
+    skip reasons, link targets, file text, error messages quoting them) can drive the
+    terminal. Only terminals are wrapped: piped or redirected output stays byte-for-byte."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    @classmethod
+    def wrap(cls, stream):
+        return cls(stream) if _is_terminal(stream) and not isinstance(stream, cls) else stream
+
+    def write(self, s):
+        return self._inner.write(term_safe(s))
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+@contextlib.contextmanager
+def terminal_safe_output():
+    """Wrap sys.stdout and sys.stderr while inside, when they are terminals."""
+    saved = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = _TermSafe.wrap(sys.stdout), _TermSafe.wrap(sys.stderr)
+    try:
+        yield
+    finally:
+        sys.stdout, sys.stderr = saved
 
 
 def _main(a) -> int:

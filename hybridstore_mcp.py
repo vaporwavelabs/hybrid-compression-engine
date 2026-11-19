@@ -794,6 +794,8 @@ def main(argv) -> int:
             print(f"error: arguments are not valid JSON: {e}", file=sys.stderr)
             return 2
         text, bad = call_tool(tools, rest[1], args)
+        if hs._is_terminal(sys.stdout):         # store text must not drive the terminal; pipes get it as is
+            text = hs.term_safe(text)
         sys.stdout.buffer.write(text.encode("utf-8", errors="replace") + b"\n")
         return 1 if bad else 0
     serve(tools)

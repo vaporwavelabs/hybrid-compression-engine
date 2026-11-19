@@ -820,4 +820,6 @@ def main(argv) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    with hs.terminal_safe_output():      # store text must not drive the terminal
+        code = main(sys.argv[1:])
+    sys.exit(code)
