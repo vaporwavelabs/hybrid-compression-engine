@@ -17,7 +17,7 @@ It lists five Phase I bugs and Phase II fixes: a naive XOR boundary test (fix: a
 | `hybridstore.py` | The engine and CLI (commands below) |
 | `bench.py` | Builds the sample datasets, checks round trips, runs an incremental-backup run and the corruption test, compares against baselines |
 | `bench_large.py` | Packs, verifies and restores one large file (default 2 GiB) and reports peak memory |
-| `test_hybridstore.py` | 52 checks (`HS_TEST_ONLY=encrypt,parity` runs a subset): streaming, snapshots, v1 compatibility, crash recovery, path safety, large media, locking, skipped files, strict verify, decompression bombs, metadata, unchanged-file reuse, prune (copy/repack/dictionary, policies, dry run, refusals), and the safeguards (damaged footers and manifests, `pack`/`unpack` refusals, files changing while read, full damage reports), Reed-Solomon parity (incremental = full rebuild, bit-exact repair of packs/manifests/footers/header, refusal beyond capacity, stale or damaged sidecar), interleaved parity (2 MiB bursts, `--m 4`), encryption (no plaintext on disk, wrong password vs damage, padding, CLI, MCP), `repair --dry-run`, cloud placeholders, damaged block lengths, Windows junctions, `--pack-mb` / `--fsync`, and restore safety (hostile file lists, links, all-or-nothing restore, full disks, names Windows cannot hold, a hidden newest snapshot, a store inside its own source) |
+| `test_hybridstore.py` | 53 checks (`HS_TEST_ONLY=encrypt,parity` runs a subset): streaming, snapshots, v1 compatibility, crash recovery, path safety, large media, locking, skipped files, strict verify, decompression bombs, metadata, unchanged-file reuse, prune (copy/repack/dictionary, policies, dry run, refusals), and the safeguards (damaged footers and manifests, `pack`/`unpack` refusals, files changing while read, full damage reports), Reed-Solomon parity (incremental = full rebuild, bit-exact repair of packs/manifests/footers/header, refusal beyond capacity, stale or damaged sidecar), interleaved parity (2 MiB bursts, `--m 4`), encryption (no plaintext on disk, wrong password vs damage, padding, CLI, MCP), `repair --dry-run`, cloud placeholders, damaged block lengths, Windows junctions, `--pack-mb` / `--fsync`, and restore safety (hostile file lists, links, all-or-nothing restore, full disks, names Windows cannot hold, a hidden newest snapshot, a store inside its own source) |
 | `FORMAT.md` | Byte-level specification of the store format |
 | `hybridstore.cmd` | Windows launcher that uses the local `.venv` |
 | `hybridstore_mcp.py` | Read-only MCP server: lets an LLM list, read, search and diff snapshots without unpacking (see below) |
@@ -225,7 +225,7 @@ Building it found an engine bug. After an interrupted write, the parity check ha
 
 ```
 python hybridstore.py pack <dir> <store> --encrypt --password-file pw.txt
-python hybridstore.py backup <dir> <store> --password-file pw.txt      # stays encrypted
+python hybridstore.py backup <dir> <store> --password-file pw.txt      # stays encrypted; refuses an unencrypted store, creates a missing one encrypted
 python hybridstore.py passwd <store> --password-file old.txt --new-password-file new.txt
 ```
 

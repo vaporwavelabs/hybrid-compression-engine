@@ -1012,6 +1012,41 @@ def _():
     hs.set_password(None); hs._KEYS.clear()
 
 
+@check("encryption CLI: a password makes backup refuse an unencrypted store and encrypt a missing one")
+def _():
+    src = _enc_tree("enc4")
+    plain, missing = os.path.join(TMP, "enc4_plain.hcs"), os.path.join(TMP, "enc4_new.hcs")
+    pw = os.path.join(TMP, "pw4.txt")
+    open(pw, "w").write("job password\n")
+    hs.set_password(None); hs._KEYS.clear()
+    assert _quiet("pack", src, plain)[0] == 0
+    before = open(plain, "rb").read()
+    # a store that replaced the encrypted one gets no plaintext: --password-file or the env variable
+    code, out = _quiet("backup", src, plain, "--password-file", pw)
+    assert code == 1 and "not encrypted" in out, (code, out)
+    os.environ[hs.PASSWORD_ENV] = "job password"
+    try:
+        code, out = _quiet("backup", src, plain)
+    finally:
+        del os.environ[hs.PASSWORD_ENV]
+    assert code == 1 and "not encrypted" in out, (code, out)
+    assert open(plain, "rb").read() == before
+    assert _quiet("backup", src, plain)[0] == 0                  # no password: unencrypted as before
+    # a deleted store is created encrypted under the given password, and appending keeps it so
+    assert _quiet("backup", src, missing, "--password-file", pw)[0] == 0
+    assert _quiet("backup", src, missing, "--password-file", pw)[0] == 0
+    assert b"TOP SECRET" not in open(missing, "rb").read()
+    hs.set_password(None); hs._KEYS.clear()
+    try:
+        hs.StoreReader(missing)
+        raise AssertionError("a store created with a password opened without it")
+    except hs.PasswordError:
+        pass
+    with hs.StoreReader(missing, password="job password") as r:
+        assert r.encrypted and len(r.snapshots) == 2
+    hs._KEYS.clear()
+
+
 # ---------------------------------------------------------------- interleaved parity
 
 def _big_store(name, mb=20):

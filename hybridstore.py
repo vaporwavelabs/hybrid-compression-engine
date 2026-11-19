@@ -1058,8 +1058,11 @@ class StoreWriter:
                 proven = _precheck_parity(path, self.stats)
             with StoreReader(path, codec=self.codec, load_index=True, password=self.password) as r:
                 if self.encrypt and not r.encrypted:
-                    raise IntegrityError(f"{path} is not encrypted; encryption is chosen when a store is "
-                                         f"created (pack --encrypt into a new store)")
+                    raise IntegrityError(f"{path} is not encrypted, but encryption was asked for (--encrypt, or a "
+                                         f"password for `backup`: --password-file / {PASSWORD_ENV}). Nothing was "
+                                         f"backed up: if this store was encrypted, it has been replaced. Encryption "
+                                         f"is chosen when a store is created (pack --encrypt into a new store); to "
+                                         f"back up into an unencrypted store, give no password")
                 if r.tail_snapshot is not None:
                     raise IntegrityError(
                         f"{path}: the newest snapshot (#{len(r.snapshots) + 1}) is complete but its footer "
@@ -3305,7 +3308,10 @@ def main(argv) -> int:
                             "and report them")
         p.add_argument("--encrypt", action="store_true",
                        help="new store only: seal everything with ChaCha20-Poly1305 under a password "
-                            "(scrypt). Appending to an encrypted store needs the password, nothing else")
+                            "(scrypt). Appending to an encrypted store needs the password, nothing else"
+                            + (f". Implied when a password is given (--password-file / {PASSWORD_ENV}): `backup` "
+                               f"then refuses an unencrypted store and creates a missing one encrypted"
+                               if name == "backup" else ""))
         p.add_argument("input_dir"); p.add_argument("store")
         p.add_argument("--level", type=int, default=19,
                        help="zstd level 1-22 (default 19; 9 is ~15x faster for ~10%% less ratio)")
@@ -3514,8 +3520,11 @@ def _main(a) -> int:
                           parity=False if a.no_parity else None, pack_mb=a.pack_mb, encrypt=a.encrypt,
                           cloud_files=a.cloud_files, catalog=not a.no_catalog)
         if a.cmd == "backup":
+            # A store password is a demand for encryption: never append plaintext to an unencrypted
+            # store, or create one, when the store this job protects with a password was replaced or deleted.
+            encrypt = a.encrypt or bool(a.password_file) or bool(os.environ.get(PASSWORD_ENV))
             return _write(a.store, a.input_dir, append=True, level=a.level, workers=a.workers,
-                          rehash=a.rehash, pack_mb=a.pack_mb, encrypt=a.encrypt,
+                          rehash=a.rehash, pack_mb=a.pack_mb, encrypt=encrypt,
                           cloud_files=a.cloud_files, precheck=not a.no_precheck, catalog=not a.no_catalog)
         if a.cmd == "prune":
             return _prune_cli(a)
