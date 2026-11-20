@@ -1685,6 +1685,61 @@ def _():
     assert sys.stdout is before
 
 
+@check("restore metadata goes through handles: a link swapped in for a restored folder changes nothing outside")
+def _():
+    import stat as st_
+    base = os.path.join(TMP, "f4")
+    root, outside = os.path.join(base, "out"), os.path.join(base, "elsewhere")
+    os.makedirs(os.path.join(root, "real"))
+    os.makedirs(outside)
+    victim = os.path.join(outside, "victim.txt")
+    open(victim, "w").write("x")
+    os.utime(outside, ns=(10**18, 10**18))
+    os.utime(victim, ns=(10**18, 10**18))
+    before = [os.stat(q).st_mtime_ns for q in (outside, victim)] + [os.stat(q).st_mode for q in (outside, victim)]
+    link = os.path.join(root, "swapped")
+    if os.name == "nt":
+        import _winapi
+        _winapi.CreateJunction(outside, link)
+    else:
+        os.symlink(outside, link)
+    e = hs.FileEntry(path="swapped", kind=hs.KIND_DIR, mode=0o40777, mtime_ns=5 * 10**17, size=0, sha256=b"")
+    f = hs.FileEntry(path="swapped/victim.txt", kind=hs.KIND_FILE, mode=0o100444, mtime_ns=5 * 10**17, size=1, sha256=b"")
+    if os.name == "nt":
+        rf = hs._win_root(root)
+        for path, ent in ((link, e), (os.path.join(link, "victim.txt"), f)):   # the link, and a path through it
+            try:
+                hs._apply_meta_win(path, ent, rf)
+                raise AssertionError(f"metadata applied through a junction: {path}")
+            except OSError:
+                pass
+        try:
+            hs._make_writable(os.path.join(link, "victim.txt"), rf)
+            raise AssertionError("attributes cleared through a junction")
+        except OSError:
+            pass
+        hs._apply_meta_win(os.path.join(root, "real"), e, rf)                 # a real folder inside: applied
+        assert os.stat(os.path.join(root, "real")).st_mtime_ns == 5 * 10**17
+    else:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for parts in (["swapped"], ["swapped", "victim.txt"]):
+                try:
+                    hs._dir_meta_beneath(fd, parts, e)
+                    raise AssertionError(f"metadata applied through a symlink: {parts}")
+                except OSError:
+                    pass
+            hs._dir_meta_beneath(fd, ["real"], e)
+            got = os.stat(os.path.join(root, "real"))
+            assert got.st_mtime_ns == 5 * 10**17 and st_.S_IMODE(got.st_mode) == 0o777
+        finally:
+            os.close(fd)
+        assert hs._safe_mode(0o46777) == 0o777          # no setuid / setgid from a store, folders too
+    after = [os.stat(q).st_mtime_ns for q in (outside, victim)] + [os.stat(q).st_mode for q in (outside, victim)]
+    assert after == before, (before, after)
+    os.remove(link) if os.name != "nt" else os.rmdir(link)
+
+
 if __name__ == "__main__":
     shutil.rmtree(TMP, ignore_errors=True)
     print(f"\nall {len(passed)} checks passed")

@@ -960,34 +960,137 @@ def _make_junction(target: str, dest: str, e: "FileEntry") -> bool:
     return True
 
 
-def _set_win_attrs(path: str, attrs: int):
-    import ctypes
-    ctypes.windll.kernel32.SetFileAttributesW(path, (attrs & WIN_ATTR_KEEP) or WIN_ATTR_NORMAL)
+# Restore metadata is applied through handles, never by name: between the containment checks and the
+# end of a restore, anyone who can write in the output folder could swap a restored file or folder (or
+# one of its parents) for a link, and a chmod / utime by name would then change whatever it points at.
+#   POSIX:   a file's mode and mtime are set on the temp file's own descriptor before it is renamed
+#            into place; a folder is reached from the output folder one name at a time, each opened
+#            with O_NOFOLLOW | O_DIRECTORY, and changed through that descriptor. No fallback by name.
+#   Windows: each entry is opened without following reparse points, refused if it is one, and changed
+#            only if the handle's final path is inside the output folder's final path.
+
+def _safe_mode(mode: int) -> int:
+    """Permission bits from a store, without setuid / setgid (files and folders)."""
+    return stat.S_IMODE(mode) & ~(stat.S_ISUID | stat.S_ISGID)
 
 
-def _make_writable(path: str):
-    """Clear read-only / hidden / system so an existing file can be replaced."""
-    if os.name == "nt":
-        _set_win_attrs(path, 0)
-    else:
-        os.chmod(path, stat.S_IMODE(os.lstat(path).st_mode) | stat.S_IWUSR)
-
-
-def _apply_meta(path: str, e: "FileEntry"):
-    """Restore mtime, then permissions / attributes (read-only last, so the
-    mtime can still be set)."""
+def _meta_fd(fd: int, e: "FileEntry"):
+    """POSIX: restore mtime and mode on an open descriptor."""
     if e.mtime_ns >= 0:
-        os.utime(path, ns=(e.mtime_ns, e.mtime_ns))
+        os.utime(fd, ns=(e.mtime_ns, e.mtime_ns))
+    if e.mode:
+        os.fchmod(fd, _safe_mode(e.mode))
+
+
+def _dir_meta_beneath(root_fd: int, parts: list[str], e: "FileEntry"):
+    """POSIX: restore a folder's metadata, reaching it from root_fd one name at a
+    time without following any link. OSError if any step is not a real folder."""
+    flags = (os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+             | getattr(os, "O_CLOEXEC", 0))
+    fd = os.dup(root_fd)
+    try:
+        for name in parts:
+            nfd = os.open(name, flags, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        _meta_fd(fd, e)
+    finally:
+        os.close(fd)
+
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    class _FileBasicInfo(ctypes.Structure):
+        _fields_ = [("CreationTime", ctypes.c_longlong), ("LastAccessTime", ctypes.c_longlong),
+                    ("LastWriteTime", ctypes.c_longlong), ("ChangeTime", ctypes.c_longlong),
+                    ("FileAttributes", wintypes.DWORD)]
+
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _k32.CreateFileW.restype = wintypes.HANDLE
+    _k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                 wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    _k32.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID,
+                                                  wintypes.DWORD]
+    _k32.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID,
+                                                wintypes.DWORD]
+    _k32.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD,
+                                               wintypes.DWORD]
+    _k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+
+def _win_open_attr(path: str):
+    """Windows: a handle that can read and write path's attributes and times,
+    on the entry itself (a link or junction is opened, not followed)."""
+    h = _k32.CreateFileW(path, 0x80 | 0x100, 0x7, None, 3, 0x02000000 | 0x00200000, None)
+    if h is None or h == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error(), path)
+    return h
+
+
+def _win_final_path(h, path: str) -> str:
+    buf = ctypes.create_unicode_buffer(32768)
+    n = _k32.GetFinalPathNameByHandleW(h, buf, 32768, 0)
+    if not n or n >= 32768:
+        raise ctypes.WinError(ctypes.get_last_error(), path)
+    return os.path.normcase(buf.value)
+
+
+def _win_root(root: str) -> str:
+    """Windows: the output folder's final path, for _win_set_meta."""
+    h = _win_open_attr(root)
+    try:
+        return _win_final_path(h, root)
+    finally:
+        _k32.CloseHandle(h)
+
+
+def _win_set_meta(path: str, root_final: str, mtime_ns: int | None, attrs: int | None):
+    """Windows: set times (mtime_ns, both access and write) and/or attributes on
+    path through one handle, refusing a link / junction and anything whose final
+    path is not inside root_final."""
+    h = _win_open_attr(path)
+    try:
+        info = _FileBasicInfo()
+        if not _k32.GetFileInformationByHandleEx(h, 0, ctypes.byref(info), ctypes.sizeof(info)):
+            raise ctypes.WinError(ctypes.get_last_error(), path)
+        if info.FileAttributes & 0x400:
+            raise OSError(0, "it is a link now, so it was left alone", path)
+        final = _win_final_path(h, path)
+        if not final.startswith(root_final.rstrip("\\") + "\\"):
+            raise OSError(0, "it is no longer inside the output folder, so it was left alone", path)
+        info = _FileBasicInfo()                       # zero = leave unchanged
+        if mtime_ns is not None and mtime_ns >= 0:
+            info.LastAccessTime = info.LastWriteTime = mtime_ns // 100 + 116444736000000000
+        if attrs is not None:
+            info.FileAttributes = (attrs & WIN_ATTR_KEEP) or WIN_ATTR_NORMAL
+        if not _k32.SetFileInformationByHandle(h, 0, ctypes.byref(info), ctypes.sizeof(info)):
+            raise ctypes.WinError(ctypes.get_last_error(), path)
+    finally:
+        _k32.CloseHandle(h)
+
+
+def _make_writable(path: str, root_final: str | None):
+    """Clear read-only / hidden / system so an existing file can be replaced
+    (Windows). POSIX needs no change to replace or delete a file, so nothing is
+    changed; only the old behaviour of failing on another user's file is kept."""
     if os.name == "nt":
-        if e.attrs:
-            _set_win_attrs(path, e.attrs)
-        elif e.mode and not e.mode & stat.S_IWUSR and e.kind == KIND_FILE:
-            _set_win_attrs(path, 0x1)
-    elif e.mode:
-        mode = stat.S_IMODE(e.mode)
-        if e.kind == KIND_FILE:
-            mode &= ~(stat.S_ISUID | stat.S_ISGID)    # never hand out setuid/setgid from a store
-        os.chmod(path, mode)
+        _win_set_meta(path, root_final, None, 0)
+    else:
+        euid = os.geteuid()
+        if euid != 0 and os.lstat(path).st_uid != euid:
+            raise PermissionError(1, "Operation not permitted", path)
+
+
+def _apply_meta_win(path: str, e: "FileEntry", root_final: str):
+    """Windows: restore mtime and attributes (read-only included) in one step."""
+    attrs = None
+    if e.attrs:
+        attrs = e.attrs
+    elif e.mode and not e.mode & stat.S_IWUSR and e.kind == KIND_FILE:
+        attrs = 0x1
+    _win_set_meta(path, root_final, e.mtime_ns, attrs)
 
 
 def _safe_parts(path: str) -> list[str]:
@@ -2199,9 +2302,14 @@ class StoreReader:
             created.extend(reversed(missing))
 
         staged, dirs, links, moved = [], [], [], 0    # staged: (temp file, destination, entry)
+        root_final = root_fd = None
         try:
             # 1. write and prove everything, changing nothing that exists
             mkdirs(root)
+            if os.name == "nt":
+                root_final = _win_root(root)
+            else:
+                root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
             for parts, e in plan:
                 if e.kind == KIND_DIR:
                     dest = os.path.join(parent_of(parts, e), parts[-1])
@@ -2209,7 +2317,7 @@ class StoreReader:
                         raise IntegrityError(f"unsafe path: {e.path} is a link in the output folder "
                                              f"that leads outside {root}")
                     mkdirs(dest)
-                    dirs.append((dest, e))
+                    dirs.append((dest, e, parts))
                 elif e.kind in (KIND_LINK, KIND_DIRLINK):
                     if e.size > LINK_TARGET_MAX:
                         raise IntegrityError(f"{e.path}: symlink target of {e.size:,} bytes; the file list "
@@ -2227,11 +2335,14 @@ class StoreReader:
                 if _is_link(dest):
                     os.unlink(dest)                 # replace the link itself, never its target
                 elif os.path.lexists(dest):
-                    _make_writable(dest)
+                    _make_writable(dest, root_final)
                 os.replace(tmp, dest)
                 moved += 1
-                _apply_meta(dest, e)
+                if os.name == "nt":                 # POSIX: already set on the temp file
+                    _apply_meta_win(dest, e, root_final)
         except BaseException:
+            if root_fd is not None:
+                os.close(root_fd)
             for tmp, _, _ in staged[moved:]:
                 try:
                     os.remove(tmp)
@@ -2254,17 +2365,24 @@ class StoreReader:
                 elif os.path.isdir(dest):
                     raise OSError(0, "a directory is in the way")
                 elif os.path.lexists(dest):
-                    _make_writable(dest)
+                    _make_writable(dest, root_final)
                     os.remove(dest)
                 if not _make_junction(target, dest, e):
                     os.symlink(target, dest, target_is_directory=e.kind == KIND_DIRLINK)
             except OSError as ex:
                 warnings.append(f"{e.path}: symlink -> {target} not created ({ex.strerror or ex})")
-        for dest, e in sorted(dirs, key=lambda d: d[1].path.count("/"), reverse=True):
-            try:
-                _apply_meta(dest, e)        # after the contents, so the mtime sticks
-            except OSError as ex:
-                warnings.append(f"{e.path}: metadata not restored ({ex.strerror or ex})")
+        try:
+            for dest, e, parts in sorted(dirs, key=lambda d: d[1].path.count("/"), reverse=True):
+                try:                        # after the contents, so the mtime sticks
+                    if os.name == "nt":
+                        _apply_meta_win(dest, e, root_final)
+                    else:
+                        _dir_meta_beneath(root_fd, parts, e)
+                except OSError as ex:
+                    warnings.append(f"{e.path}: metadata not restored ({ex.strerror or ex})")
+        finally:
+            if root_fd is not None:
+                os.close(root_fd)
         if fsync and os.name != "nt":       # Windows cannot open a directory to fsync it
             for d in {root} | {os.path.dirname(os.path.join(root, *parts)) for parts, _ in plan}:
                 try:
@@ -2296,8 +2414,10 @@ class StoreReader:
             with os.fdopen(fd, "wb") as fh:
                 for c in self.iter_file(e):
                     fh.write(c)
+                fh.flush()
+                if os.name != "nt":
+                    _meta_fd(fh.fileno(), e)    # on this file itself, before it is moved into place
                 if fsync:
-                    fh.flush()
                     os.fsync(fh.fileno())
         except BaseException:
             try:
@@ -3265,19 +3385,66 @@ def _write(store: str, src: str, append: bool, level: int = 19, workers: int | N
         print(f"parity {st.parity}: {store}.hcp")
     if st.skipped:
         _print_skipped(st.skipped)
-    cat_ok = _update_catalog(store) if catalog else True
+    if w.created and w.encrypt:
+        # A new encrypted store: any catalog or semantic index at this path described whatever was here
+        # before (readable or not, present or not) and keeps it unencrypted beside the encrypted store.
+        cat_ok = _remove_plain_sidecars(store, sem=True)
+    else:
+        cat_ok = _update_catalog(store) if catalog else True
     return 3 if (st.skipped or st.changed or st.parity.startswith("warning") or st.precheck_fixed
                  or not cat_ok) else 0
 
 
+def _remove_plain_sidecars(store: str, sem: bool = False) -> bool:
+    """Delete the unencrypted sidecars that must not sit beside an encrypted
+    store: its catalog (<store>.cat, the catalog's journal and damaged catalogs
+    set aside as <store>.cat.bad-*) and, with sem=True (the store was just
+    created, so any index there describes what was here before), its semantic
+    index (<store>.sem and journal). Otherwise a .sem is kept: beside an
+    encrypted store one is only built on purpose (--allow-plaintext-index).
+    Each deletion is named in a note. False = one could not be deleted (warned)."""
+    import glob
+    failed = []
+
+    def drop(paths, lock_for):
+        paths = [q for q in paths if os.path.lexists(q)]
+        if not paths:
+            return
+        try:
+            lock = _StoreLock(lock_for)         # not while a catalog / index update is writing it
+        except (StoreLockedError, OSError) as e:
+            failed.extend((q, e) for q in paths)
+            return
+        try:
+            for q in paths:
+                try:
+                    os.remove(q)
+                    print(f"note: deleted {q}: it described this store's files unencrypted, "
+                          f"and the store is encrypted", file=sys.stderr)
+                except OSError as e:
+                    failed.append((q, e))
+        finally:
+            lock.release()
+
+    cat = store + ".cat"
+    drop([cat, cat + "-journal", *sorted(glob.glob(glob.escape(cat) + ".bad-*"))], cat)
+    if sem:
+        drop([store + ".sem", store + ".sem-journal"], store + ".sem")
+    for q, e in failed:
+        print(f"warning: {q} describes this store's files unencrypted beside the encrypted store, but "
+              f"could not be deleted ({e}); delete it", file=sys.stderr)
+    return not failed
+
+
 def _update_catalog(store: str) -> bool:
     """Bring <store>.cat up to date after a write. The data is already safe, so
-    a failure here only warns. Encrypted stores get no catalog. False = warned."""
+    a failure here only warns. Encrypted stores get no catalog (one found there
+    is left over and deleted). False = warned."""
     try:
         import hybridstore_catalog as hc
         with StoreReader(store) as r:
             if r.encrypted:
-                return True
+                return _remove_plain_sidecars(store)
             st = hc.update_store(store, r, log=lambda m: print(m, file=sys.stderr))
         print(hc.summary(st))
         return True

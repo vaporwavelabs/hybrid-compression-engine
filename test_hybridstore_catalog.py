@@ -211,6 +211,46 @@ def _():
     assert code == 2 and "encrypted" in out and not os.path.exists(hc.catalog_path(store)), out
 
 
+@check("an encrypted store never keeps an unencrypted catalog or semantic index beside it")
+def _():
+    src, pw = os.path.join(TMP, "rsrc"), os.path.join(TMP, "pw.txt")
+    tree(src, {"secret_name.txt": b"the secret is here\n"})
+    open(pw, "w").write("pw\n")
+    # the old unencrypted store is: still there / deleted / damaged; with and without --no-catalog
+    for how in ("there", "deleted", "damaged"):
+        for extra in ([], ["--no-catalog"]):
+            store = os.path.join(TMP, f"r_{how}{len(extra)}.hcs")
+            cat, sem = hc.catalog_path(store), store + ".sem"
+            assert cli("pack", src, store)[0] == 0 and os.path.exists(cat)
+            bad = cat + ".bad-20260101-000000"
+            shutil.copyfile(cat, bad)
+            open(sem, "wb").write(b"embeddings and hashes of the old store")
+            if how == "deleted":
+                os.remove(store)
+            elif how == "damaged":
+                open(store, "r+b").write(b"XXXXXXXX")
+            code, out = cli("pack", "--force", "--encrypt", "--password-file", pw, *extra, src, store)
+            assert code == 0 and not any(map(os.path.exists, (cat, bad, sem))), (how, extra, code, out)
+            assert all(f"deleted {q}" in out for q in (cat, bad, sem)), out
+    # a backup that creates a new encrypted store where only old sidecars remain removes them too
+    store = os.path.join(TMP, "r_new.hcs")
+    shutil.copyfile(hc.catalog_path(STORE), hc.catalog_path(store))
+    open(store + ".sem", "wb").write(b"old")
+    code, out = cli("backup", "--password-file", pw, src, store)
+    assert code == 0 and not os.path.exists(hc.catalog_path(store)) and not os.path.exists(store + ".sem"), out
+    # appending to an encrypted store keeps a .sem built for it on purpose (--allow-plaintext-index),
+    # but a catalog left beside it goes
+    open(store + ".sem", "wb").write(b"built with --allow-plaintext-index")
+    shutil.copyfile(hc.catalog_path(STORE), hc.catalog_path(store))
+    code, out = cli("backup", "--password-file", pw, src, store)
+    assert code == 0 and not os.path.exists(hc.catalog_path(store)) and os.path.exists(store + ".sem"), out
+    # unencrypted stores: --no-catalog leaves the catalog alone, as before
+    plain = os.path.join(TMP, "r_plain.hcs")
+    assert cli("pack", src, plain)[0] == 0
+    code, out = cli("pack", "--force", "--no-catalog", src, plain)
+    assert code == 0 and os.path.exists(hc.catalog_path(plain)) and "deleted" not in out, (code, out)
+
+
 if __name__ == "__main__":
     shutil.rmtree(TMP, ignore_errors=True)
     print(f"\nall {len(passed)} checks passed")
