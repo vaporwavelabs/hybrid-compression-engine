@@ -1137,6 +1137,12 @@ class StoreWriter:
             self.created = False
         else:
             self.codec.set_key(None)
+            pin = _pinned(path) if append and not self.encrypt else None
+            if pin:
+                raise PasswordError(f"{path} was encrypted when this computer last opened it, but it is "
+                                    f"missing now: nothing was backed up, so your files are not written "
+                                    f"unencrypted. To recreate it encrypted, give the password (--password-file "
+                                    f"or {PASSWORD_ENV}); to start an unencrypted store there, use `pack`")
             if self.encrypt:
                 pw = self.password if self.password is not None else _password_for(
                     "password for the new store: ", confirm=True)
@@ -3375,7 +3381,7 @@ def main(argv) -> int:
                             "(scrypt). Appending to an encrypted store needs the password, nothing else"
                             + (f". Implied when a password is given (--password-file / {PASSWORD_ENV}): `backup` "
                                f"then refuses an unencrypted store and creates a missing one encrypted"
-                               if name == "backup" else ""))
+                               if name == "backup" else ". Implied by --password-file"))
         p.add_argument("input_dir"); p.add_argument("store")
         p.add_argument("--level", type=int, default=19,
                        help="zstd level 1-22 (default 19; 9 is ~15x faster for ~10%% less ratio)")
@@ -3555,7 +3561,7 @@ class _StderrTail:
 # embeddings, overrides and isolates that reorder text on screen, and lone surrogates
 # (bytes of a name that were not UTF-8). Joiners, LRM/RLM and the other format
 # characters ordinary text needs are left alone.
-_TERM_UNSAFE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f  ‪-‮⁦-⁩\ud800-\udfff]")
+_TERM_UNSAFE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069\ud800-\udfff]")
 
 
 def term_safe(text: str) -> str:
@@ -3640,8 +3646,11 @@ def _main(a) -> int:
                 print(f"error: {a.store} is {what}; `pack` would replace it. Use `backup` to add a "
                       f"snapshot, or `pack --force` to replace it", file=sys.stderr)
                 return 2
+            # --password-file names this store's password, so it is a demand for encryption
+            # (the variable may serve other stores too, so it alone does not encrypt a new store)
             return _write(a.store, a.input_dir, append=False, level=a.level, workers=a.workers,
-                          parity=False if a.no_parity else None, pack_mb=a.pack_mb, encrypt=a.encrypt,
+                          parity=False if a.no_parity else None, pack_mb=a.pack_mb,
+                          encrypt=a.encrypt or bool(a.password_file),
                           cloud_files=a.cloud_files, catalog=not a.no_catalog)
         if a.cmd == "backup":
             # A store password is a demand for encryption: never append plaintext to an unencrypted

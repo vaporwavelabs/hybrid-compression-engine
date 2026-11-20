@@ -1088,6 +1088,40 @@ def _():
     assert _quiet("pack", src, store, "--force")[0] == 0
     assert not hs._pinned(store)
     assert _quiet("list", store)[0] == 0
+    # 3b. the encrypted store is deleted: a backup with no password up front (the prompt case) must not
+    #     recreate it unencrypted with the owner's files, nor drop the pin; with the password it comes back sealed
+    gone = os.path.join(TMP, "enc5_gone.hcs")
+    assert _quiet("pack", src, gone, "--encrypt", "--password-file", pw)[0] == 0
+    for f in os.listdir(TMP):
+        if f.startswith("enc5_gone.hcs"):
+            os.remove(os.path.join(TMP, f))
+    hs.set_password(None); hs._KEYS.clear()
+    code, out = _quiet("backup", src, gone)
+    assert code == 5 and "missing now" in out, (code, out)
+    assert not os.path.exists(gone) and hs._pinned(gone)
+    assert _quiet("backup", src, gone, "--password-file", pw)[0] == 0
+    assert b"TOP SECRET" not in open(gone, "rb").read() and hs._pinned(gone)
+    hs.set_password(None); hs._KEYS.clear()
+    # 3c. pack with a password file encrypts even without --encrypt (it used to write plaintext silently)
+    named = os.path.join(TMP, "enc5_named.hcs")
+    assert _quiet("pack", src, named, "--password-file", pw)[0] == 0
+    assert b"TOP SECRET" not in open(named, "rb").read() and hs._pinned(named)
+    hs.set_password(None); hs._KEYS.clear()
+    # 3d. end to end: a snapshot appended without the key (unsealed blocks after the real ones) is refused
+    forged = os.path.join(TMP, "enc5_forged.hcs")
+    assert _quiet("pack", src, forged, "--encrypt", "--password-file", pw)[0] == 0
+    evil = os.path.join(TMP, "enc5_evil"); tree(evil, {"secret-name-alpha.txt": b"ATTACKER CONTENT"})
+    w = hs.StoreWriter(forged, append=True, password="pin password", workers=1)
+    w.codec.set_key(None)                       # what someone without the password can write
+    w.add_tree(evil); w.close()
+    hs.set_password(None); hs._KEYS.clear()
+    code, out = _quiet("list", forged, "--password-file", pw)       # shown as damage, never as a snapshot
+    assert "DAMAGED" in out and "not encrypted, but this store is" in out, (code, out)
+    for args in (("verify", forged), ("unpack", forged, os.path.join(TMP, "enc5_forged_out"))):
+        code, out = _quiet(*args, "--password-file", pw)
+        assert code == 1 and "not encrypted, but this store is" in out, (args, code, out)
+    assert not os.path.exists(os.path.join(TMP, "enc5_forged_out", "secret-name-alpha.txt"))
+    hs.set_password(None); hs._KEYS.clear()
     # 4. a password file named for an unencrypted store this computer never saw encrypted
     code, out = _quiet("list", decoy, "--password-file", pw)
     assert code == 5 and "not encrypted" in out, (code, out)
