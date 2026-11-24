@@ -109,6 +109,13 @@ def find_rdc4(settings):
     return ''
 
 
+MAX_THREADS = 32           # rdc4's own limit on --threads
+# Repair data choices: (label, extra pack arguments). Numbers, not preset names, so an older rdc4.py also works.
+REPAIR_CHOICES = [
+    ('Standard: fixes the most damage (about 20% bigger, recommended)', []),
+    ('Light: fixes about half as much damage (about 10% bigger)', ['--parity', '20,2']),
+    ('None: smallest, but damage cannot be fixed', ['--no-parity']),
+]
 LOG_LINE_LIMIT = 5000      # the log box keeps at most this many lines (oldest are dropped)
 EVENTS_PER_TICK = 200      # at most this many queued messages are handled per screen update
 
@@ -322,13 +329,17 @@ class App(_BaseTk):
                      values=['Smallest file (slower, level 19)', 'Faster (a bit bigger, level 9)']
                      ).grid(row=0, column=1, sticky='w', padx=6)
         ttk.Label(opts, text='CPU threads:').grid(row=0, column=2, sticky='w', padx=(16, 0))
-        self.pk_threads = tk.IntVar(value=max(1, min(8, os.cpu_count() or 1)))
-        ttk.Spinbox(opts, from_=1, to=max(1, os.cpu_count() or 1), textvariable=self.pk_threads,
+        cores = max(1, min(MAX_THREADS, os.cpu_count() or 1))   # every core; the archive is identical either way
+        self.pk_threads = tk.IntVar(value=cores)
+        ttk.Spinbox(opts, from_=1, to=cores, textvariable=self.pk_threads,
                     width=5).grid(row=0, column=3, sticky='w', padx=6)
 
-        self.pk_parity = tk.BooleanVar(value=True)
-        ttk.Checkbutton(f, text='Add repair data so damage can be fixed later (recommended, about 20% bigger)',
-                        variable=self.pk_parity).grid(row=4, column=0, columnspan=4, sticky='w', pady=(8, 0))
+        rep = ttk.Frame(f)
+        rep.grid(row=4, column=0, columnspan=4, sticky='w', pady=(8, 0))
+        ttk.Label(rep, text='Repair data:').grid(row=0, column=0, sticky='w')
+        self.pk_parity = tk.StringVar(value=REPAIR_CHOICES[0][0])
+        ttk.Combobox(rep, textvariable=self.pk_parity, state='readonly', width=58,
+                     values=[label for label, _args in REPAIR_CHOICES]).grid(row=0, column=1, sticky='w', padx=6)
         self.pk_encrypt = tk.BooleanVar(value=False)
         ttk.Checkbutton(f, text='Encrypt with the password typed at the top',
                         variable=self.pk_encrypt).grid(row=5, column=0, columnspan=4, sticky='w', pady=(4, 0))
@@ -807,8 +818,7 @@ class App(_BaseTk):
             th = 1
         if th > 1:
             args += ['--threads', str(th)]
-        if not self.pk_parity.get():
-            args += ['--no-parity']
+        args += dict(REPAIR_CHOICES).get(self.pk_parity.get(), [])
         if self.pk_encrypt.get():
             if not self._need(self.password.get(), 'Type a password at the top to encrypt the archive.'):
                 return
