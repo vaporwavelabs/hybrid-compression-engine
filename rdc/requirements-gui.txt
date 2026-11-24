@@ -1,0 +1,2 @@
+# Optional, for the desktop window (rdc_gui.py): drag and drop of files and folders
+tkinterdnd2>=0.4
