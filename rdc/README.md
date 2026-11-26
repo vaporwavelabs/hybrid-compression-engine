@@ -97,7 +97,7 @@ python rdc3.py repair out.rdc3 fixed.rdc3   # parity rebuild into a NEW file, th
 python rdc3.py unpack out.rdc3 destdir [--recover]
 RDC_PASSWORD=... python rdc3.py pack --encrypt ...   # password only via environment
 python -m pytest -q test_rdc3.py
-python rdc4.py pack <dir> out.rdc4 [--level 19] [--pack-size 2097152] [--threads 4] [--parity 10,2 | --no-parity] [--encrypt] [--format 3]
+python rdc4.py pack <dir> out.rdc4 [--level 19] [--pack-size 2097152] [--threads auto|N] [--parity 10,2 | --parity light | --no-parity] [--encrypt] [--format 3]
 python rdc4.py unpack out.rdc4 destdir [--only path/in/archive] [--sparse] [--strict-names]   # also restores RDCv003 archives
 python rdc4.py verify out.rdc4 [--packs N/T]   # N/T: partial rotating check, see "3.1.5" below
 python -m pytest -q test_rdc3.py test_rdc4.py

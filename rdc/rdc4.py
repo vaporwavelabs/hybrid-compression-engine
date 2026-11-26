@@ -81,6 +81,25 @@ class Limits4(v3.Limits):
 
 # ---------------------------------------------------------------- pack (write)
 DEFAULT_PARITY = (10, 2, 65536)   # 3.1.2: RS(12,10), 64 KiB shards; parity=None turns it off
+# Named repair strengths for `--parity NAME` (opt-in; the default stays DEFAULT_PARITY). 'light' halves the
+# repair data (about 10% of the compressed data instead of 20%): up to 2 damaged 64 KiB shards are still
+# repairable in every 1.25 MiB group instead of every 640 KiB. Same RDCv004 format, so any rdc4 reads it.
+PARITY_PRESETS = {'standard': DEFAULT_PARITY, 'light': (20, 2, 65536)}
+
+
+def auto_threads():
+    """One compression thread per CPU core (capped at Limits4.max_threads). Output does not depend on it."""
+    n = os.process_cpu_count() if hasattr(os, 'process_cpu_count') else os.cpu_count()
+    return max(1, min(Limits4.max_threads, n or 1))
+
+
+def _threads_arg(v):
+    if v == 'auto':
+        return v
+    try:
+        return int(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError('expected a number or "auto"') from None
 
 
 def pack(source, dest, *, level=None, pack_size=None, threads=None, parity='default', password=None,
@@ -1513,10 +1532,13 @@ def main(argv=None):
     pk.add_argument('--format', type=int, choices=[3, 4], default=4)
     pk.add_argument('--level', type=int, default=None)
     pk.add_argument('--pack-size', type=int, default=None, help='bytes (v4), default %d' % DEFAULTS['pack_size'])
-    pk.add_argument('--threads', type=int, default=None)
+    pk.add_argument('--threads', type=_threads_arg, default='auto',
+                    help='compression threads, or "auto" (default) = one per CPU core, up to %d. '
+                         'The archive is byte-identical for any thread count' % Limits4.max_threads)
     pk.add_argument('--dict', action='store_true', help='v3 only')
     pk.add_argument('--delta', action='store_true', help='v3 only')
-    pk.add_argument('--parity', help='K,M[,SHARD] (default 10,2,65536)')
+    pk.add_argument('--parity', help='K,M[,SHARD] (default 10,2,65536), or a preset: %s'
+                    % ', '.join('%s = %d,%d' % (n, k, m) for n, (k, m, _s) in PARITY_PRESETS.items()))
     pk.add_argument('--no-parity', action='store_true', help='write no Reed-Solomon parity (smaller, not repairable)')
     pk.add_argument('--encrypt', action='store_true', help='password from env RDC_PASSWORD')
     pk.add_argument('--gear', choices=['public', 'seeded', 'keyed'], default=None)
@@ -1571,7 +1593,9 @@ def main(argv=None):
             if a.parity and a.no_parity:
                 raise ValueError('--parity and --no-parity conflict')
             par = None if a.no_parity else DEFAULT_PARITY
-            if a.parity:
+            if a.parity in PARITY_PRESETS:
+                par = PARITY_PRESETS[a.parity]
+            elif a.parity:
                 v = [int(x) for x in a.parity.split(',')]
                 par = (v[0], v[1], v[2] if len(v) > 2 else 65536)
             if a.encrypt and not pw:
@@ -1584,7 +1608,8 @@ def main(argv=None):
             else:
                 if a.dict or a.delta:
                     raise ValueError('--dict/--delta are RDCv003-only (use --format 3)')
-                r = pack(a.source, a.archive, level=a.level, pack_size=a.pack_size, threads=a.threads,
+                threads = auto_threads() if a.threads == 'auto' else a.threads
+                r = pack(a.source, a.archive, level=a.level, pack_size=a.pack_size, threads=threads,
                          min_size=a.min, avg_size=a.avg, max_size=a.max, **common)
         elif a.cmd == 'unpack':
             r = restore(a.archive, a.destination, pw, recover=a.recover, max_expansion=a.max_expansion, paths=a.only,

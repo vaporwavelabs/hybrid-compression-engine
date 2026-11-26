@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased: smaller-archive and all-cores options (format and default archive unchanged)
+- `rdc4.py pack --threads` now defaults to `auto`, one compression thread per CPU core (up to 32); it was 1.
+  Archives are byte-identical for any thread count (the 164 MB bench set packs to the same SHA-256 with
+  the old and new defaults), so only speed and memory change: 40.0 s -> 12.8 s on 4 cores, encoder memory
+  grows by roughly 25-40 MiB per extra thread. `--threads 1` gives the old behaviour.
+- `--parity` takes presets: `standard` (= 10,2, the default) and `light` (= 20,2). Light halves the repair
+  data (about 10% of the compressed data instead of 20%); up to 2 damaged 64 KiB shards are still repaired
+  in each 1.25 MiB group instead of each 640 KiB. Bench set: 66.49 MB -> 61.00 MB (-8.3%), same speed.
+  Same RDCv004 format, so any rdc4.py reads, verifies and repairs these archives.
+- Window: "Repair data" is a choice of Standard (default, unchanged archive) / Light / None instead of an
+  on/off box; it passes numbers (`--parity 20,2`), so it also works with an older rdc4.py. "CPU threads"
+  now defaults to every core (up to 32) instead of at most 8.
+- New tests `test_ratio_speed.py`; benchmark `bench/bench_ratio_speed.py`.
+
 ## 3.1.6 review notes (unreleased; code and format unchanged)
 - Test only: `test_pack_memory_independent_of_input_size` absolute cap raised 40 -> 48 MiB; the
   growth bound (< 8 MiB from 8 to 48 MiB input) is unchanged. It failed on every Python 3.14 run
