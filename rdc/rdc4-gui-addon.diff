@@ -1,0 +1,196 @@
+--- orig/rdc4.py	2026-11-24 08:17:48.722064515 +0000
++++ new/rdc4.py	2026-11-24 08:18:56.715191936 +0000
+@@ -62,6 +62,10 @@
+ DEFAULTS = dict(level=19, pack_size=2 * 1024 * 1024, threads=1, min_size=2048, avg_size=8192, max_size=32768,
+                 zstd_overrides=dict(hash_log=20, chain_log=20))
+ 
++# GUI add-on (opt-in, see `--progress`): a progress reporter. None = off, which is the default and costs one
++# global lookup per piece. It only observes byte counts; it never changes what is read, written or stored.
++_progress = None   # object with .start(stage, total) and .add(n)
++
+ 
+ class Limits4(v3.Limits):
+     max_pack = 16 * 1024 * 1024        # hard cap on declared pack raw length
+@@ -126,6 +130,9 @@
+         if not 512 <= shard <= Limits4.max_shard:
+             raise ValueError('shard size')
+     files, dirs = v3.scan_source(source)
++    prog = _progress
++    if prog is not None:
++        prog.start('pack', sum(os.stat(path).st_size for _rel, path in files))
+ 
+     tls = threading.local()
+ 
+@@ -185,6 +192,8 @@
+                     for raw, _h in chunker.iter_file(f):
+                         fh.update(raw)
+                         size += len(raw)
++                        if prog is not None:
++                            prog.add(len(raw))
+                         cid = ctx.chunk_id(raw)
+                         if cid in index:
+                             ci, off = index[cid]
+@@ -222,7 +231,11 @@
+             k, m, shard = parity
+             groups = []
+             data_spool.flush()
++            if prog is not None:
++                prog.start('parity', data_len)
+             for gstart, glen, s in parity_layout(data_len, k, shard):
++                if prog is not None:
++                    prog.add(glen)
+                 data_spool.seek(gstart)
+                 buf = data_spool.read(glen).ljust(k * s, b'\0')
+                 shards = [buf[i * s:(i + 1) * s] for i in range(k)]
+@@ -681,12 +694,17 @@
+             if self.on_warning:
+                 self.on_warning(warns[-1])
+         spill_info = None
++        prog = _progress
++        if prog is not None:
++            prog.start('verify', sum(e[1] for e in self.files))
+         if not budget or cost <= budget:
+             mode, digests = 'sequential', []
+             for e in self.files:
+                 h = hashlib.sha256()
+                 for b in self.iter_file(e):
+                     h.update(b)
++                    if prog is not None:
++                        prog.add(len(b))
+                 if h.hexdigest() != e[2]:
+                     raise IntegrityError(f'file digest mismatch: {e[0]}')
+                 digests.append([e[0], e[1], h.hexdigest()])
+@@ -701,6 +719,8 @@
+                     h = hashlib.sha256()
+                     for b in self._iter_spilled(e, spill, where):
+                         h.update(b)
++                        if prog is not None:
++                            prog.add(len(b))
+                     if h.hexdigest() != e[2]:
+                         raise IntegrityError(f'file digest mismatch: {e[0]}')
+                     digests.append([e[0], e[1], e[2]])
+@@ -775,10 +795,13 @@
+     sparse: every piece is still hashed; all-zero pieces are seeked over (a hole on filesystems that
+     support them) and the file is truncated to its full size before the sync, so a trailing hole
+     still yields the right length."""
++    prog = _progress
+     with f:
+         h = hashlib.sha256()
+         for b in pieces:
+             h.update(b)
++            if prog is not None:
++                prog.add(len(b))
+             if sparse and b and b.count(0) == len(b):
+                 f.seek(len(b), 1)
+             else:
+@@ -917,6 +940,8 @@
+                          view.total, a.limits)
+         if created:
+             os.mkdir(dest_dir, 0o755)
++        if _progress is not None:
++            _progress.start('unpack', view.total)
+         log = v3.SyncLog()
+         inner_stage = getattr(view, 'stage_all', None)
+         if inner_stage is None:          # RDCv003 reader: piece-order stager with the same options
+@@ -1500,9 +1525,11 @@
+     pk.add_argument('--min', type=int, default=None)
+     pk.add_argument('--avg', type=int, default=None)
+     pk.add_argument('--max', type=int, default=None)
++    _add_gui_options(pk)
+     for name in ('unpack', 'verify', 'repair', 'ls'):
+         s = sub.add_parser(name)
+         s.add_argument('archive')
++        _add_gui_options(s)
+         if name in ('unpack', 'repair'):
+             s.add_argument('destination')
+         if name == 'unpack':
+@@ -1530,6 +1557,15 @@
+                                 'parity shard hashes; no decode). Run N=0..T-1 over T days to cover all')
+     a = p.parse_args(argv)
+     pw = os.environ.get('RDC_PASSWORD')
++    if a.password_stdin:
++        pw = _read_password_stdin()
++        if not pw:
++            print(json.dumps(dict(error='ValueError', message='--password-stdin: no password on standard input')),
++                  file=sys.stderr)
++            return 1
++    global _progress
++    if a.progress:
++        _progress = _JsonProgress(sys.stderr)
+     try:
+         if a.cmd == 'pack':
+             if a.parity and a.no_parity:
+@@ -1539,7 +1575,7 @@
+                 v = [int(x) for x in a.parity.split(',')]
+                 par = (v[0], v[1], v[2] if len(v) > 2 else 65536)
+             if a.encrypt and not pw:
+-                raise ValueError('--encrypt needs RDC_PASSWORD in the environment')
++                raise ValueError('--encrypt needs RDC_PASSWORD in the environment (or --password-stdin)')
+             gear = a.gear or ('keyed' if a.encrypt else 'public')
+             common = dict(parity=par, password=pw if a.encrypt else None, gear=gear, seed=a.seed, hash_name=a.hash)
+             if a.format == 3:
+@@ -1572,9 +1608,64 @@
+     except (IntegrityError, FileExistsError, ValueError, KeyError) as exc:
+         print(json.dumps(dict(error=type(exc).__name__, message=str(exc))), file=sys.stderr)
+         return 1
++    finally:
++        prog_done, _progress = _progress, None
++    if prog_done is not None:          # success only: errors keep their JSON as the last stderr line
++        prog_done.finish()
+     print(json.dumps(r, default=str))
+     return 0
+ 
+ 
++# ---------------------------------------------------------------- GUI add-on CLI options (opt-in)
++def _add_gui_options(sp):
++    sp.add_argument('--progress', action='store_true',
++                    help='print progress as JSON lines on stderr, e.g. {"event": "progress", "stage": "pack", '
++                         '"done": N, "total": T} (at most ~5 per second); the result line is unchanged')
++    sp.add_argument('--password-stdin', action='store_true',
++                    help='read the password from the first line of standard input instead of RDC_PASSWORD')
++
++
++def _read_password_stdin():
++    return sys.stdin.readline().rstrip('\r\n')
++
++
++class _JsonProgress:
++    """Throttled JSON-lines progress on a text stream. Only counts bytes; never touches archive data."""
++    def __init__(self, out, interval=0.2):
++        import time
++        self._time = time.monotonic
++        self.out, self.interval = out, interval
++        self.stage, self.done, self.total, self._last = None, 0, 0, 0.0
++
++    def _emit(self):
++        try:
++            self.out.write(json.dumps(dict(event='progress', stage=self.stage, done=self.done,
++                                           total=self.total)) + '\n')
++            self.out.flush()
++        except (OSError, ValueError):
++            pass   # a closed pipe must never break the actual work
++
++    def start(self, stage, total):
++        if self.stage is not None:      # close the previous stage at 100%
++            self.done = max(self.done, self.total)
++            self._emit()
++        self.stage, self.done, self.total = stage, 0, int(total)
++        self._last = self._time()
++        self._emit()
++
++    def add(self, n):
++        self.done += n
++        now = self._time()
++        if now - self._last >= self.interval:
++            self._last = now
++            self._emit()
++
++    def finish(self):
++        if self.stage is not None:
++            self.done = max(self.done, self.total)
++            self._emit()
++            self.stage = None
++
++
+ if __name__ == '__main__':
+     sys.exit(main())

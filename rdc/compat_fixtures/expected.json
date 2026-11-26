@@ -1,0 +1,15 @@
+{
+ "files": {
+  "docs/readme.txt": "0e3fd354e4a8675612135f45d9991ccafe646cbd7186535d85597280e6e84dc9",
+  "bin/r.bin": "9503a4c7637f38e08070152115c354a1169a44817d202ee4d979614c5d816cfd",
+  "dup/a.log": "72d3593bf4f71ae458c5062b00dd5890c094810d731820f255d0302059124ec0",
+  "dup/b.log": "72d3593bf4f71ae458c5062b00dd5890c094810d731820f255d0302059124ec0",
+  "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "unicode/caf\u00e9.txt": "a064545dd4be980e727b04bdb3373761c435d2a910f29ff6df26460eb1ed5fa7"
+ },
+ "dirs": [
+  "emptydir"
+ ],
+ "password": "compat-test-only",
+ "made_by": "rdc3.py 3.0.2 extracted from research-data-compress-v3.0.2.zip"
+}

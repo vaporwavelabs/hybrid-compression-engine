@@ -1,0 +1,5 @@
+zstandard==0.25.0  # preferred; fallbacks: stdlib compression.zstd (3.14+) or backports.zstd (no --dict training)
+numpy>=2.0
+cryptography>=46.0.7  # 3.1.5 floor (security fixes)
+blake3>=1.0  # optional
+pytest>=8  # tests

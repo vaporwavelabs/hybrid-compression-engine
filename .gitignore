@@ -8,3 +8,4 @@ venv/
 bench_data/
 *.store
 .DS_Store
+bench_out/
